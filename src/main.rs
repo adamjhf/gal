@@ -42,7 +42,7 @@ struct WorkflowsResponse {
 
 #[derive(serde::Deserialize, Debug)]
 struct Job {
-    // id: u64,
+    id: u64,
     name: String,
     status: String,
     conclusion: Option<String>,
@@ -163,6 +163,77 @@ async fn get_workflows(
     Ok(workflows_response.workflow_runs)
 }
 
+async fn get_job_logs(
+    owner: &str,
+    repo: &str,
+    job_id: u64,
+    token: &str,
+) -> Result<String, Box<dyn Error>> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
+        owner, repo, job_id
+    );
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github.v3+json")
+        .header(
+            "User-Agent",
+            format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        if status == 404 {
+            return Err("Logs not available yet".into());
+        }
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "GitHub API request failed with status {}: {}",
+            status, error_text
+        )
+        .into());
+    }
+
+    let logs = response.text().await?;
+    Ok(logs)
+}
+
+fn get_last_n_log_lines(logs: &str, n: usize) -> Vec<String> {
+    let lines: Vec<&str> = logs.lines().collect();
+    let start_index = if lines.len() > n { lines.len() - n } else { 0 };
+
+    lines[start_index..]
+        .iter()
+        .map(|line| strip_ansi_codes(line))
+        .filter(|line| !line.trim().is_empty()) // Filter out empty lines
+        .collect()
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+    let mut result = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            while let Some(next_ch) = chars.next() {
+                if next_ch.is_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 fn get_status_symbol(status: &str, conclusion: &Option<String>) -> &'static str {
     match status {
         "in_progress" => "🔄",
@@ -250,6 +321,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("       Conclusion: {}", conclusion);
                             }
                             println!("       URL: {}", job.html_url);
+                            // if job.status == "in_progress" {
+                            //     match get_job_logs(&owner, &repo, job.id, &token).await {
+                            //         Ok(logs) => {
+                            //             let last_lines = get_last_n_log_lines(&logs, 5);
+                            //             if last_lines.is_empty() {
+                            //                 println!("         No recent log output available");
+                            //             } else {
+                            //                 for line in last_lines {
+                            //                     if !line.trim().is_empty() {
+                            //                         let display_line = if line.len() > 100 {
+                            //                             format!("{}...", &line[..97])
+                            //                         } else {
+                            //                             line
+                            //                         };
+                            //                         println!("         │ {}", display_line);
+                            //                     }
+                            //                 }
+                            //             }
+                            //         }
+                            //         Err(e) => {
+                            //             println!("         Error fetching logs: {}", e);
+                            //         }
+                            //     }
+                            // }
                             println!();
                         }
                     }
