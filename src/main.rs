@@ -5,33 +5,12 @@ use std::process::Command;
 
 use chrono::{DateTime, Utc};
 use octocrab::{
-    Page,
+    Octocrab, Page,
     models::{
         RunId,
         workflows::{Conclusion, Job, Run, Status},
     },
 };
-
-#[derive(Debug)]
-struct AppError {
-    message: String,
-}
-
-impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl Error for AppError {}
-
-impl From<&str> for AppError {
-    fn from(msg: &str) -> Self {
-        AppError {
-            message: msg.to_string(),
-        }
-    }
-}
 
 fn get_git_origin_url() -> Result<String, Box<dyn Error>> {
     let output = Command::new("git")
@@ -75,15 +54,12 @@ fn parse_github_repo(url: &str) -> Result<(String, String), Box<dyn Error>> {
 }
 
 async fn get_workflow_jobs(
+    client: &Octocrab,
     owner: &str,
     repo: &str,
     run_id: RunId,
-    token: &str,
 ) -> Result<Page<Job>, Box<dyn Error>> {
-    let octocrab = octocrab::Octocrab::builder()
-        .personal_token(token.to_owned())
-        .build()?;
-    let jobs = octocrab
+    let jobs = client
         .workflows(owner, repo)
         .list_jobs(run_id)
         .send()
@@ -92,18 +68,11 @@ async fn get_workflow_jobs(
 }
 
 async fn get_workflow_runs(
+    client: &Octocrab,
     owner: &str,
     repo: &str,
-    token: &str,
 ) -> Result<Page<Run>, Box<dyn Error>> {
-    let octocrab = octocrab::Octocrab::builder()
-        .personal_token(token.to_owned())
-        .build()?;
-    let runs = octocrab
-        .workflows(owner, repo)
-        .list_all_runs()
-        .send()
-        .await?;
+    let runs = client.workflows(owner, repo).list_all_runs().send().await?;
     Ok(runs)
 }
 
@@ -201,9 +170,9 @@ fn format_duration(started_at: &DateTime<Utc>, completed_at: &Option<DateTime<Ut
             let minutes = total_seconds / 60;
             let seconds = total_seconds % 60;
             if minutes > 0 {
-                format!("{}m {}s", minutes, seconds)
+                format!("{minutes}m {seconds}s")
             } else {
-                format!("{}s", seconds)
+                format!("{seconds}s")
             }
         }
         None => "Running...".to_string(),
@@ -222,8 +191,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let repo = "wayfarer";
     println!("Repository: {owner}/{repo}");
 
+    let octocrab = octocrab::Octocrab::builder()
+        .personal_token(token.to_owned())
+        .build()?;
+
     println!("\nFetching running GitHub Actions...");
-    let workflows = get_workflow_runs(&owner, &repo, &token).await?;
+    let workflows = get_workflow_runs(&octocrab, &owner, repo).await?;
 
     if workflows.items.is_empty() {
         println!("No currently running GitHub Actions found.");
@@ -241,7 +214,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("   Started: {}", workflow.created_at);
             println!("   URL: {}", workflow.html_url);
             println!("\n   Jobs:");
-            match get_workflow_jobs(&owner, &repo, workflow.id, &token).await {
+            match get_workflow_jobs(&octocrab, &owner, repo, workflow.id).await {
                 Ok(jobs) => {
                     if jobs.items.is_empty() {
                         println!("     No jobs found for this workflow.");
@@ -251,9 +224,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let duration = format_duration(&job.started_at, &job.completed_at);
 
                             println!("     {} {} ({:?})", emoji, job.name, job.status);
-                            println!("       Duration: {}", duration);
+                            println!("       Duration: {duration}");
                             if let Some(conclusion) = job.conclusion {
-                                println!("       Conclusion: {:?}", conclusion);
+                                println!("       Conclusion: {conclusion:?}");
                             }
                             println!("       URL: {}", job.html_url);
                             // if job.status == "in_progress" {
@@ -285,7 +258,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Err(e) => {
-                    println!("     Error fetching jobs: {}", e);
+                    println!("     Error fetching jobs: {e}");
                 }
             }
             println!();
@@ -293,4 +266,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct AppError {
+    message: String,
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl Error for AppError {}
+
+impl From<&str> for AppError {
+    fn from(msg: &str) -> Self {
+        AppError {
+            message: msg.to_string(),
+        }
+    }
 }
