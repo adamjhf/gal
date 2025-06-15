@@ -3,6 +3,15 @@ use std::error::Error;
 use std::fmt;
 use std::process::Command;
 
+use chrono::{DateTime, Utc};
+use octocrab::{
+    Page,
+    models::{
+        RunId,
+        workflows::{Conclusion, Job, Run, Status},
+    },
+};
+
 #[derive(Debug)]
 struct AppError {
     message: String,
@@ -22,38 +31,6 @@ impl From<&str> for AppError {
             message: msg.to_string(),
         }
     }
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct Workflow {
-    id: u64,
-    name: String,
-    head_branch: String,
-    status: String,
-    conclusion: Option<String>,
-    html_url: String,
-    created_at: String,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct WorkflowsResponse {
-    workflow_runs: Vec<Workflow>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct Job {
-    id: u64,
-    name: String,
-    status: String,
-    conclusion: Option<String>,
-    started_at: Option<String>,
-    completed_at: Option<String>,
-    html_url: String,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct JobsResponse {
-    jobs: Vec<Job>,
 }
 
 fn get_git_origin_url() -> Result<String, Box<dyn Error>> {
@@ -100,178 +77,136 @@ fn parse_github_repo(url: &str) -> Result<(String, String), Box<dyn Error>> {
 async fn get_workflow_jobs(
     owner: &str,
     repo: &str,
-    run_id: u64,
+    run_id: RunId,
     token: &str,
-) -> Result<Vec<Job>, Box<dyn Error>> {
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://api.github.com/repos/{}/{}/actions/runs/{}/jobs",
-        owner, repo, run_id
-    );
-
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github.v3+json")
-        .header(
-            "User-Agent",
-            format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
-        )
+) -> Result<Page<Job>, Box<dyn Error>> {
+    let octocrab = octocrab::Octocrab::builder()
+        .personal_token(token.to_owned())
+        .build()?;
+    let jobs = octocrab
+        .workflows(owner, repo)
+        .list_jobs(run_id)
         .send()
         .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "GitHub API request failed with status {}: {}",
-            status, error_text
-        )
-        .into());
-    }
-
-    let jobs_response: JobsResponse = response.json().await?;
-    Ok(jobs_response.jobs)
+    Ok(jobs)
 }
 
-async fn get_workflows(
+async fn get_workflow_runs(
     owner: &str,
     repo: &str,
     token: &str,
-) -> Result<Vec<Workflow>, Box<dyn Error>> {
-    let client = reqwest::Client::new();
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/actions/runs");
-
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github.v3+json")
-        .header(
-            "User-Agent",
-            format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
-        )
+) -> Result<Page<Run>, Box<dyn Error>> {
+    let octocrab = octocrab::Octocrab::builder()
+        .personal_token(token.to_owned())
+        .build()?;
+    let runs = octocrab
+        .workflows(owner, repo)
+        .list_all_runs()
         .send()
         .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("GitHub API request failed with status {status}: {error_text}").into());
-    }
-
-    let workflows_response: WorkflowsResponse = response.json().await?;
-    Ok(workflows_response.workflow_runs)
+    Ok(runs)
 }
 
-async fn get_job_logs(
-    owner: &str,
-    repo: &str,
-    job_id: u64,
-    token: &str,
-) -> Result<String, Box<dyn Error>> {
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
-        owner, repo, job_id
-    );
+// async fn get_job_logs(
+//     owner: &str,
+//     repo: &str,
+//     job_id: u64,
+//     token: &str,
+// ) -> Result<String, Box<dyn Error>> {
+//     let client = reqwest::Client::new();
+//     let url = format!(
+//         "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
+//         owner, repo, job_id
+//     );
 
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github.v3+json")
-        .header(
-            "User-Agent",
-            format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .await?;
+//     let response = client
+//         .get(&url)
+//         .header("Authorization", format!("Bearer {}", token))
+//         .header("Accept", "application/vnd.github.v3+json")
+//         .header(
+//             "User-Agent",
+//             format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+//         )
+//         .send()
+//         .await?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        if status == 404 {
-            return Err("Logs not available yet".into());
-        }
-        let error_text = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "GitHub API request failed with status {}: {}",
-            status, error_text
-        )
-        .into());
-    }
+//     if !response.status().is_success() {
+//         let status = response.status();
+//         if status == 404 {
+//             return Err("Logs not available yet".into());
+//         }
+//         let error_text = response.text().await.unwrap_or_default();
+//         return Err(format!(
+//             "GitHub API request failed with status {}: {}",
+//             status, error_text
+//         )
+//         .into());
+//     }
 
-    let logs = response.text().await?;
-    Ok(logs)
-}
+//     let logs = response.text().await?;
+//     Ok(logs)
+// }
 
-fn get_last_n_log_lines(logs: &str, n: usize) -> Vec<String> {
-    let lines: Vec<&str> = logs.lines().collect();
-    let start_index = if lines.len() > n { lines.len() - n } else { 0 };
+// fn get_last_n_log_lines(logs: &str, n: usize) -> Vec<String> {
+//     let lines: Vec<&str> = logs.lines().collect();
+//     let start_index = if lines.len() > n { lines.len() - n } else { 0 };
 
-    lines[start_index..]
-        .iter()
-        .map(|line| strip_ansi_codes(line))
-        .filter(|line| !line.trim().is_empty()) // Filter out empty lines
-        .collect()
-}
+//     lines[start_index..]
+//         .iter()
+//         .map(|line| strip_ansi_codes(line))
+//         .filter(|line| !line.trim().is_empty()) // Filter out empty lines
+//         .collect()
+// }
 
-fn strip_ansi_codes(input: &str) -> String {
-    let mut result = String::new();
-    let mut chars = input.chars().peekable();
+// fn strip_ansi_codes(input: &str) -> String {
+//     let mut result = String::new();
+//     let mut chars = input.chars().peekable();
 
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next(); // consume '['
-            while let Some(next_ch) = chars.next() {
-                if next_ch.is_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
+//     while let Some(ch) = chars.next() {
+//         if ch == '\x1b' && chars.peek() == Some(&'[') {
+//             chars.next(); // consume '['
+//             while let Some(next_ch) = chars.next() {
+//                 if next_ch.is_alphabetic() {
+//                     break;
+//                 }
+//             }
+//         } else {
+//             result.push(ch);
+//         }
+//     }
 
-    result
-}
+//     result
+// }
 
-fn get_status_symbol(status: &str, conclusion: &Option<String>) -> &'static str {
+fn get_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> &'static str {
     match status {
-        "in_progress" => "🔄",
-        "queued" => "⏳",
-        "completed" => match conclusion.as_ref().map(|s| s.as_str()) {
-            Some("success") => "✅",
-            Some("failure") => "❌",
-            Some("cancelled") => "🚫",
-            Some("skipped") => "⏭️",
+        Status::InProgress => "🔄",
+        Status::Queued => "⏳",
+        Status::Completed => match conclusion.as_ref() {
+            Some(Conclusion::Success) => "✅",
+            Some(Conclusion::Failure) => "❌",
+            Some(Conclusion::Cancelled) => "🚫",
+            Some(Conclusion::Skipped) => "⏭️",
             _ => "🔘",
         },
         _ => "❓",
     }
 }
 
-fn format_duration(started_at: &Option<String>, completed_at: &Option<String>) -> String {
-    match (started_at, completed_at) {
-        (Some(start), Some(end)) => {
-            match (
-                chrono::DateTime::parse_from_rfc3339(start),
-                chrono::DateTime::parse_from_rfc3339(end),
-            ) {
-                (Ok(start_time), Ok(end_time)) => {
-                    let duration = end_time.signed_duration_since(start_time);
-                    let total_seconds = duration.num_seconds();
-                    let minutes = total_seconds / 60;
-                    let seconds = total_seconds % 60;
-                    if minutes > 0 {
-                        format!("{}m {}s", minutes, seconds)
-                    } else {
-                        format!("{}s", seconds)
-                    }
-                }
-                _ => "Unknown duration".to_string(),
+fn format_duration(started_at: &DateTime<Utc>, completed_at: &Option<DateTime<Utc>>) -> String {
+    match completed_at {
+        Some(end_time) => {
+            let duration = end_time.signed_duration_since(started_at);
+            let total_seconds = duration.num_seconds();
+            let minutes = total_seconds / 60;
+            let seconds = total_seconds % 60;
+            if minutes > 0 {
+                format!("{}m {}s", minutes, seconds)
+            } else {
+                format!("{}s", seconds)
             }
         }
-        (Some(_), None) => "Running...".to_string(),
-        _ => "Not started".to_string(),
+        None => "Running...".to_string(),
     }
 }
 
@@ -288,14 +223,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Repository: {owner}/{repo}");
 
     println!("\nFetching running GitHub Actions...");
-    let workflows = get_workflows(&owner, &repo, &token).await?;
+    let workflows = get_workflow_runs(&owner, &repo, &token).await?;
 
-    if workflows.is_empty() {
+    if workflows.items.is_empty() {
         println!("No currently running GitHub Actions found.");
     } else {
-        println!("Found {} workflow(s):\n", workflows.len());
+        println!("Found {} workflow(s):\n", workflows.items.len());
 
-        for workflow in workflows {
+        for workflow in workflows.items {
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             println!("🔄 {} (ID: {})", workflow.name, workflow.id);
             println!("   Branch: {}", workflow.head_branch);
@@ -308,17 +243,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("\n   Jobs:");
             match get_workflow_jobs(&owner, &repo, workflow.id, &token).await {
                 Ok(jobs) => {
-                    if jobs.is_empty() {
+                    if jobs.items.is_empty() {
                         println!("     No jobs found for this workflow.");
                     } else {
-                        for job in jobs {
+                        for job in jobs.items {
                             let emoji = get_status_symbol(&job.status, &job.conclusion);
                             let duration = format_duration(&job.started_at, &job.completed_at);
 
-                            println!("     {} {} ({})", emoji, job.name, job.status);
+                            println!("     {} {} ({:?})", emoji, job.name, job.status);
                             println!("       Duration: {}", duration);
                             if let Some(conclusion) = job.conclusion {
-                                println!("       Conclusion: {}", conclusion);
+                                println!("       Conclusion: {:?}", conclusion);
                             }
                             println!("       URL: {}", job.html_url);
                             // if job.status == "in_progress" {
