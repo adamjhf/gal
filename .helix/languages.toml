@@ -1,0 +1,8 @@
+[[language]]
+name = "rust"
+formatter = { command = "rustfmt", args = [
+  "--emit",
+  "stdout",
+  "--edition",
+  "2024",
+] }
