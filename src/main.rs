@@ -251,7 +251,7 @@ struct WorkflowRunsListWidget {
 #[derive(Debug, Default)]
 struct WorkflowRunsListState {
     workflow_runs: Vec<WorkflowRun>,
-    constraint_lens: (u16, u16, u16, u16, u16),
+    constraint_lens: (u16, u16, u16, u16),
     loading_state: LoadingState,
     table_state: TableState,
 }
@@ -265,17 +265,10 @@ enum LoadingState {
     Error(String),
 }
 
-fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16, u16, u16) {
+fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16, u16) {
     let status_len = runs
         .iter()
         .map(|run| run.status.as_str())
-        .map(UnicodeWidthStr::width)
-        .max()
-        .unwrap_or(0);
-    let conclusion_len = runs
-        .iter()
-        .filter_map(|run| run.conclusion.as_ref())
-        .map(|conclusion| conclusion.as_str())
         .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0);
@@ -298,11 +291,10 @@ fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16, u16, u16) {
         .max()
         .unwrap_or(0);
     (
-        status_len as u16,
-        conclusion_len as u16,
         id_len as u16,
-        name_len as u16,
         branch_len as u16,
+        name_len as u16,
+        status_len as u16,
     )
 }
 
@@ -376,8 +368,9 @@ impl From<&OctoRun> for WorkflowRun {
             id: format!("{}", run.id.0),
             name: run.name.to_string(),
             branch: run.head_branch.to_string(),
-            status: run.status.to_string(),
-            conclusion: run.conclusion.clone().map(|s| s.to_string()),
+            status: run.conclusion.as_ref().unwrap_or(&run.status).to_string(),
+            created_at: run.created_at,
+            html_url: run.html_url.as_ref().into(),
         }
     }
 }
@@ -392,7 +385,7 @@ impl Widget for &WorkflowRunsListWidget {
             .title(loading_state)
             .title_bottom("j/k to scroll, q to quit");
 
-        let header = ["Status", "Result", "ID", "Name", "Branch"]
+        let header = ["ID", "Branch", "Name", "Status"]
             .into_iter()
             .map(Cell::from)
             .collect::<Row>()
@@ -402,9 +395,8 @@ impl Widget for &WorkflowRunsListWidget {
         let widths = [
             Constraint::Length(state.constraint_lens.0 + 1),
             Constraint::Length(state.constraint_lens.1 + 1),
-            Constraint::Length(state.constraint_lens.2 + 1),
             Constraint::Fill(1),
-            Constraint::Length(state.constraint_lens.4 + 1),
+            Constraint::Length(state.constraint_lens.3 + 1),
         ];
         let table = Table::new(rows, widths)
             .block(block)
@@ -425,19 +417,14 @@ struct WorkflowRun {
     name: String,
     branch: String,
     status: String,
-    conclusion: Option<String>,
+    created_at: DateTime<Utc>,
+    html_url: String,
 }
 
 impl From<&WorkflowRun> for Row<'_> {
     fn from(runs: &WorkflowRun) -> Self {
         let run = runs.clone();
-        Row::new(vec![
-            run.status,
-            run.conclusion.unwrap_or_default(),
-            format!("{}", run.id),
-            run.name,
-            run.branch,
-        ])
+        Row::new(vec![run.id, run.branch, run.name, run.status])
     }
 }
 
