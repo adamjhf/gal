@@ -22,9 +22,10 @@
         pkgs = import nixpkgs {
           inherit system;
         };
+        profile = fenix.packages.${system}.complete;
 
         # https://github.com/nix-community/fenix/issues/178
-        cargo = fenix.packages.${system}.complete.cargo.overrideAttrs (old: {
+        cargo = profile.cargo.overrideAttrs (old: {
           postBuild = pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
             cargo="./cargo/bin/cargo"
             install_name_tool \
@@ -32,21 +33,17 @@
               "$cargo"
           '';
         });
-        devRustToolchain =
-          with fenix.packages.${system};
-          combine [
-            cargo
-            complete.rustc
-            complete.clippy
-            complete.rustfmt
-            rust-analyzer
-          ];
-        buildRustToolchain =
-          with fenix.packages.${system};
-          combine [
-            cargo
-            complete.rustc
-          ];
+        devRustToolchain = fenix.packages.${system}.combine [
+          cargo
+          profile.rustc
+          profile.clippy
+          profile.rustfmt
+          profile.rust-analyzer
+        ];
+        buildRustToolchain = fenix.packages.${system}.combine [
+          cargo
+          profile.rustc
+        ];
 
         craneLib = (crane.mkLib pkgs).overrideToolchain buildRustToolchain;
 
