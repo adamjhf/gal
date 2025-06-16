@@ -33,12 +33,21 @@ async fn main() -> Result<()> {
         .init();
     color_eyre::install()?;
     let terminal = ratatui::init();
-    let app_result = App::default().run(terminal).await;
+
+    // let token =
+    //     env::var("GITHUB_TOKEN").map_err(|_| eyre!("GITHUB_TOKEN environment variable not set"))?;
+
+    let origin_url = get_git_origin_url()?;
+
+    let (owner, _repo) = parse_github_repo(&origin_url)?;
+    let repo = "nixos".to_string();
+
+    let app_result = App::new(owner, repo).run(terminal).await;
     ratatui::restore();
     app_result
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct App {
     should_quit: bool,
     workflow_runs: WorkflowRunsListWidget,
@@ -46,6 +55,15 @@ struct App {
 
 impl App {
     const FRAMES_PER_SECOND: f32 = 60.0;
+
+    pub fn new(owner: String, repo: String) -> Self {
+        let workflow_runs = WorkflowRunsListWidget::default();
+        workflow_runs.set_repo(owner, repo);
+        Self {
+            should_quit: false,
+            workflow_runs,
+        }
+    }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         self.workflow_runs.run();
@@ -89,6 +107,8 @@ struct WorkflowRunsListState {
     constraint_lens: (u16, u16, u16, u16),
     loading_state: LoadingState,
     table_state: TableState,
+    repo_owner: String,
+    repo: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -114,8 +134,10 @@ impl WorkflowRunsListWidget {
     async fn fetch_runs(self) {
         let mut interval = interval(Duration::from_secs(10));
         loop {
+            let repo_owner = self.state.write().unwrap().repo_owner.clone();
+            let repo = self.state.write().unwrap().repo.clone();
             self.set_loading_state(LoadingState::Loading);
-            match get_all_workflow_runs().await {
+            match get_all_workflow_runs(repo_owner, &repo).await {
                 Ok(runs) => self.on_load(runs),
                 Err(err) => self.on_err(&err),
             }
@@ -141,6 +163,11 @@ impl WorkflowRunsListWidget {
         self.state.write().unwrap().loading_state = state;
     }
 
+    fn set_repo(&self, repo_owner: String, repo: String) {
+        self.state.write().unwrap().repo_owner = repo_owner;
+        self.state.write().unwrap().repo = repo;
+    }
+
     fn scroll_down(&self) {
         self.state.write().unwrap().table_state.scroll_down_by(1);
     }
@@ -156,7 +183,7 @@ impl Widget for &WorkflowRunsListWidget {
 
         let loading_state = Line::from(format!("{:?}", state.loading_state)).right_aligned();
         let block = Block::bordered()
-            .title("Workflow Runs")
+            .title(format!("{}/{}", state.repo_owner, state.repo))
             .title(loading_state)
             .title_bottom("j/k to scroll, q to quit");
 
@@ -200,15 +227,9 @@ impl Widget for &WorkflowRunsListWidget {
     }
 }
 
-async fn get_all_workflow_runs() -> Result<Vec<WorkflowRun>> {
+async fn get_all_workflow_runs(owner: String, repo: &str) -> Result<Vec<WorkflowRun>> {
     let token =
         env::var("GITHUB_TOKEN").map_err(|_| eyre!("GITHUB_TOKEN environment variable not set"))?;
-
-    let origin_url = get_git_origin_url()?;
-
-    let (owner, _repo) = parse_github_repo(&origin_url)?;
-    let repo = "nixos";
-
     let octocrab = octocrab::Octocrab::builder()
         .personal_token(token.to_owned())
         .build()?;
