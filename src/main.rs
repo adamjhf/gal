@@ -21,6 +21,7 @@ use ratatui::widgets::{
     Block, Cell, HighlightSpacing, Row, StatefulWidget, Table, TableState, Widget,
 };
 use ratatui::{DefaultTerminal, Frame};
+use tokio::time::interval;
 use tokio_stream::StreamExt;
 use tracing::warn;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -329,19 +330,21 @@ impl WorkflowRunsListWidget {
     }
 
     async fn fetch_runs(self) {
-        // this runs once, but you could also run this in a loop, using a channel that accepts
-        // messages to refresh on demand, or with an interval timer to refresh every N seconds
-        self.set_loading_state(LoadingState::Loading);
-        match get_all_workflow_runs().await {
-            Ok(runs) => self.on_load(runs),
-            Err(err) => self.on_err(&err),
+        let mut interval = interval(Duration::from_secs(10));
+        loop {
+            self.set_loading_state(LoadingState::Loading);
+            match get_all_workflow_runs().await {
+                Ok(runs) => self.on_load(runs),
+                Err(err) => self.on_err(&err),
+            }
+            interval.tick().await;
         }
     }
 
     fn on_load(&self, runs: Vec<WorkflowRun>) {
         let mut state = self.state.write().unwrap();
         state.loading_state = LoadingState::Loaded;
-        state.workflow_runs.extend(runs);
+        state.workflow_runs = runs;
         state.constraint_lens = constraint_lens(&state.workflow_runs);
         if !state.workflow_runs.is_empty() {
             state.table_state.select(Some(0));
@@ -458,9 +461,7 @@ impl Widget for &WorkflowRunsListWidget {
             .highlight_symbol("> ")
             .row_highlight_style(Style::new().on_dark_gray());
 
-        if state.loading_state != LoadingState::Loading {
-            StatefulWidget::render(table, area, buf, &mut state.table_state);
-        }
+        StatefulWidget::render(table, area, buf, &mut state.table_state);
     }
 }
 
