@@ -1,4 +1,5 @@
 /target
 /.direnv
+/logs
 
 .DS_STORE

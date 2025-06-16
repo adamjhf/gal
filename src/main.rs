@@ -16,12 +16,15 @@ use octocrab::{
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
-use ratatui::text::Line;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{
     Block, Cell, HighlightSpacing, Row, StatefulWidget, Table, TableState, Widget,
 };
 use ratatui::{DefaultTerminal, Frame};
 use tokio_stream::StreamExt;
+use tracing::warn;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use unicode_width::UnicodeWidthStr;
 
 fn get_git_origin_url() -> Result<String> {
@@ -67,19 +70,19 @@ fn parse_github_repo(url: &str) -> Result<(String, String)> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
-// async fn get_workflow_jobs(
-//     client: &Octocrab,
-//     owner: &str,
-//     repo: &str,
-//     run_id: RunId,
-// ) -> Result<Page<Job>, Box<dyn Error>> {
-//     let jobs = client
-//         .workflows(owner, repo)
-//         .list_jobs(run_id)
-//         .send()
-//         .await?;
-//     Ok(jobs)
-// }
+async fn get_workflow_jobs(
+    client: &Octocrab,
+    owner: &str,
+    repo: &str,
+    run_id: RunId,
+) -> Result<Page<Job>> {
+    let jobs = client
+        .workflows(owner, repo)
+        .list_jobs(run_id)
+        .send()
+        .await?;
+    Ok(jobs)
+}
 
 async fn get_workflow_runs(client: &Octocrab, owner: &str, repo: &str) -> Result<Page<Run>> {
     let runs = client.workflows(owner, repo).list_all_runs().send().await?;
@@ -157,7 +160,22 @@ async fn get_workflow_runs(client: &Octocrab, owner: &str, repo: &str) -> Result
 //     result
 // }
 
-fn get_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> &'static str {
+fn get_run_status_symbol(status: &String, conclusion: &Option<String>) -> &'static str {
+    match status.as_str() {
+        "in_progress" => "🔄",
+        "queued" => "⏳",
+        "completed" => match conclusion.as_ref().map(|s| s.as_str()) {
+            Some("success") => "✅",
+            Some("failure") => "❌",
+            Some("cancelled") => "🚫",
+            Some("skipped") => "⏭️",
+            _ => "🔘",
+        },
+        _ => "❓",
+    }
+}
+
+fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> &'static str {
     match status {
         Status::InProgress => "🔄",
         Status::Queued => "⏳",
@@ -191,6 +209,12 @@ fn format_duration(started_at: &DateTime<Utc>, completed_at: &Option<DateTime<Ut
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "app.log");
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
+        .init();
     color_eyre::install()?;
     let terminal = ratatui::init();
     let app_result = App::default().run(terminal).await;
@@ -268,7 +292,7 @@ enum LoadingState {
 fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16, u16) {
     let status_len = runs
         .iter()
-        .map(|run| run.status.as_str())
+        .flat_map(|run| run.status.iter().map(|s| s.as_str()))
         .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0);
@@ -309,13 +333,12 @@ impl WorkflowRunsListWidget {
         // messages to refresh on demand, or with an interval timer to refresh every N seconds
         self.set_loading_state(LoadingState::Loading);
         match get_all_workflow_runs().await {
-            Ok(page) => self.on_load(&page),
+            Ok(runs) => self.on_load(runs),
             Err(err) => self.on_err(&err),
         }
     }
 
-    fn on_load(&self, page: &Page<Run>) {
-        let runs = page.items.iter().map(Into::into);
+    fn on_load(&self, runs: Vec<WorkflowRun>) {
         let mut state = self.state.write().unwrap();
         state.loading_state = LoadingState::Loaded;
         state.workflow_runs.extend(runs);
@@ -342,14 +365,14 @@ impl WorkflowRunsListWidget {
     }
 }
 
-async fn get_all_workflow_runs() -> Result<Page<Run>> {
+async fn get_all_workflow_runs() -> Result<Vec<WorkflowRun>> {
     let token =
         env::var("GITHUB_TOKEN").map_err(|_| eyre!("GITHUB_TOKEN environment variable not set"))?;
 
     let origin_url = get_git_origin_url()?;
 
     let (owner, _repo) = parse_github_repo(&origin_url)?;
-    let repo = "wayfarer";
+    let repo = "nixos";
 
     let octocrab = octocrab::Octocrab::builder()
         .personal_token(token.to_owned())
@@ -357,22 +380,52 @@ async fn get_all_workflow_runs() -> Result<Page<Run>> {
 
     let workflows = get_workflow_runs(&octocrab, &owner, repo).await?;
 
-    Ok(workflows)
-}
-
-type OctoRun = octocrab::models::workflows::Run;
-
-impl From<&OctoRun> for WorkflowRun {
-    fn from(run: &OctoRun) -> Self {
-        Self {
-            id: format!("{}", run.id.0),
-            name: run.name.to_string(),
-            branch: run.head_branch.to_string(),
-            status: run.conclusion.as_ref().unwrap_or(&run.status).to_string(),
-            created_at: run.created_at,
-            html_url: run.html_url.as_ref().into(),
+    let details_futures = workflows.items.into_iter().map(|run| {
+        let octocrab = octocrab.clone();
+        let owner = owner.clone();
+        async move {
+            let status = run.conclusion.as_ref().unwrap_or(&run.status);
+            let job_statuses = match status.as_str() {
+                "failure" | "in_progress" => {
+                    match get_workflow_jobs(&octocrab, &owner, repo, run.id.clone()).await {
+                        Ok(jobs) => jobs
+                            .items
+                            .into_iter()
+                            .map(|job| {
+                                format!(
+                                    "     {} {}",
+                                    get_job_status_symbol(&job.status, &job.conclusion),
+                                    job.name
+                                )
+                            })
+                            .collect(),
+                        Err(err) => {
+                            warn!("{:?}", err);
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            };
+            WorkflowRun {
+                id: format!("{}", run.id.clone().0),
+                name: run.name.to_string(),
+                branch: run.head_branch.to_string(),
+                status: vec![format!(
+                    "{} {}",
+                    get_run_status_symbol(&run.status, &run.conclusion),
+                    status
+                )]
+                .into_iter()
+                .chain(job_statuses)
+                .collect(),
+                created_at: run.created_at,
+                html_url: run.html_url.clone().into(),
+            }
         }
-    }
+    });
+    let details = futures::future::join_all(details_futures).await;
+    Ok(details)
 }
 
 impl Widget for &WorkflowRunsListWidget {
@@ -395,8 +448,8 @@ impl Widget for &WorkflowRunsListWidget {
         let widths = [
             Constraint::Length(state.constraint_lens.0 + 1),
             Constraint::Length(state.constraint_lens.1 + 1),
+            Constraint::Length(state.constraint_lens.2 + 1),
             Constraint::Fill(1),
-            Constraint::Length(state.constraint_lens.3 + 1),
         ];
         let table = Table::new(rows, widths)
             .block(block)
@@ -411,12 +464,13 @@ impl Widget for &WorkflowRunsListWidget {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct WorkflowRun {
     id: String,
     name: String,
     branch: String,
-    status: String,
+    status: Vec<String>,
     created_at: DateTime<Utc>,
     html_url: String,
 }
@@ -424,7 +478,13 @@ struct WorkflowRun {
 impl From<&WorkflowRun> for Row<'_> {
     fn from(runs: &WorkflowRun) -> Self {
         let run = runs.clone();
-        Row::new(vec![run.id, run.branch, run.name, run.status])
+        Row::new(vec![
+            Cell::from(run.id),
+            Cell::from(run.branch),
+            Cell::from(run.name),
+            Cell::from(run.status.join("\n")),
+        ])
+        .height(runs.status.len() as u16)
     }
 }
 
