@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::env;
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use std::{cmp, env};
 
 use chrono::{DateTime, Utc};
 use color_eyre::{Result, eyre::ErrReport, eyre::eyre};
@@ -115,7 +115,7 @@ struct WorkflowRunsListWidget {
 #[derive(Debug, Default)]
 struct WorkflowRunsListState {
     workflow_runs: Vec<WorkflowRun>,
-    constraint_lens: (u16, u16, u16, u16),
+    constraint_lens: (u16, u16, u16),
     loading_state: LoadingState,
     table_state: TableState,
     completed_workflow_jobs: HashMap<u64, Vec<Job>>,
@@ -230,12 +230,11 @@ impl WorkflowRunsListWidget {
             };
             WorkflowRun {
                 id: format!("{}", run.id.clone().0),
-                name: run.name.to_string(),
                 branch: run.head_branch.to_string(),
-                status: vec![format!(
+                details: vec![format!(
                     "{} {}",
                     get_run_status_symbol(&run.status, &run.conclusion),
-                    status
+                    run.name,
                 )]
                 .into_iter()
                 .chain(job_statuses)
@@ -329,7 +328,7 @@ impl Widget for &WorkflowRunsListWidget {
 
             paragraph.render(area, buf);
         } else {
-            let header = ["ID", "Branch", "Name", "Status"]
+            let header = ["ID", "Branch", "Run"]
                 .into_iter()
                 .map(Cell::from)
                 .collect::<Row>()
@@ -338,8 +337,7 @@ impl Widget for &WorkflowRunsListWidget {
             let rows = state.workflow_runs.iter();
             let widths = [
                 Constraint::Length(state.constraint_lens.0 + 1),
-                Constraint::Length(state.constraint_lens.1 + 1),
-                Constraint::Length(state.constraint_lens.2 + 1),
+                Constraint::Length(cmp::max(state.constraint_lens.1 + 1, 7)),
                 Constraint::Fill(1),
             ];
             let table = Table::new(rows, widths)
@@ -358,9 +356,8 @@ impl Widget for &WorkflowRunsListWidget {
 #[derive(Debug, Clone)]
 struct WorkflowRun {
     id: String,
-    name: String,
     branch: String,
-    status: Vec<String>,
+    details: Vec<String>,
     created_at: DateTime<Utc>,
     html_url: String,
 }
@@ -371,10 +368,9 @@ impl From<&WorkflowRun> for Row<'_> {
         Row::new(vec![
             Cell::from(run.id),
             Cell::from(run.branch),
-            Cell::from(run.name),
-            Cell::from(run.status.join("\n")),
+            Cell::from(run.details.join("\n")),
         ])
-        .height(runs.status.len() as u16)
+        .height(runs.details.len() as u16)
     }
 }
 
@@ -425,10 +421,10 @@ fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> &'
 //     }
 // }
 
-fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16, u16) {
-    let status_len = runs
+fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16) {
+    let details_len = runs
         .iter()
-        .flat_map(|run| run.status.iter().map(|s| s.as_str()))
+        .flat_map(|run| run.details.iter().map(|s| s.as_str()))
         .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0);
@@ -438,24 +434,13 @@ fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16, u16) {
         .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0);
-    let name_len = runs
-        .iter()
-        .map(|run| run.name.as_str())
-        .map(UnicodeWidthStr::width)
-        .max()
-        .unwrap_or(0);
     let branch_len = runs
         .iter()
         .map(|run| run.branch.as_str())
         .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0);
-    (
-        id_len as u16,
-        branch_len as u16,
-        name_len as u16,
-        status_len as u16,
-    )
+    (id_len as u16, branch_len as u16, details_len as u16)
 }
 
 fn get_git_origin_url() -> Result<String> {
