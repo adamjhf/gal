@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::process::Command;
 use std::sync::{Arc, RwLock};
@@ -7,7 +8,7 @@ use chrono::{DateTime, Utc};
 use color_eyre::{Result, eyre::ErrReport, eyre::eyre};
 use crossterm::event::{Event, EventStream, KeyCode};
 use octocrab::{
-    Octocrab, Page,
+    Octocrab,
     models::{
         RunId,
         workflows::{Conclusion, Job, Run, Status},
@@ -18,7 +19,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, HighlightSpacing, Paragraph, Row, Table, TableState};
 use tokio::time::interval;
 use tokio_stream::StreamExt;
-use tracing::error;
+use tracing::{error, info};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use unicode_width::UnicodeWidthStr;
@@ -102,12 +103,21 @@ impl App {
     }
 }
 
+#[derive(Debug, Clone)]
+struct WorkflowRunsListWidget {
+    state: Arc<RwLock<WorkflowRunsListState>>,
+    client: Octocrab,
+    repo_owner: String,
+    repo: String,
+}
+
 #[derive(Debug, Default)]
 struct WorkflowRunsListState {
     workflow_runs: Vec<WorkflowRun>,
     constraint_lens: (u16, u16, u16, u16),
     loading_state: LoadingState,
     table_state: TableState,
+    completed_workflow_jobs: HashMap<u64, Vec<Job>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -117,14 +127,6 @@ enum LoadingState {
     Loading,
     Loaded,
     Error(String),
-}
-
-#[derive(Debug, Clone)]
-struct WorkflowRunsListWidget {
-    state: Arc<RwLock<WorkflowRunsListState>>,
-    client: Octocrab,
-    repo_owner: String,
-    repo: String,
 }
 
 impl WorkflowRunsListWidget {
@@ -189,36 +191,40 @@ impl WorkflowRunsListWidget {
             }
         };
 
-        let details_futures = workflows.items.into_iter().map(|run| async move {
+        let details_futures = workflows.into_iter().map(|run| async move {
             let status = run.conclusion.as_ref().unwrap_or(&run.status);
             let job_statuses = match status.as_str() {
-                "failure" | "in_progress" => match self.get_workflow_jobs(run.id).await {
-                    Ok(jobs) => jobs
-                        .items
-                        .into_iter()
-                        .flat_map(|job| {
-                            let step_statuses = job.steps.into_iter().map(|step| {
-                                format!(
-                                    "      {} {}",
-                                    get_job_status_symbol(&step.status, &step.conclusion),
-                                    step.name
-                                )
-                            });
-                            vec![format!(
-                                "   {} {}",
-                                get_job_status_symbol(&job.status, &job.conclusion),
-                                job.name
-                            )]
+                "failure" | "in_progress" => {
+                    match self
+                        .get_workflow_jobs(run.id, run.status == "completed")
+                        .await
+                    {
+                        Ok(jobs) => jobs
                             .into_iter()
-                            .chain(step_statuses)
-                            .collect::<Vec<_>>()
-                        })
-                        .collect(),
-                    Err(err) => {
-                        error!("{:?}", err);
-                        Vec::new()
+                            .flat_map(|job| {
+                                let step_statuses = job.steps.into_iter().map(|step| {
+                                    format!(
+                                        "      {} {}",
+                                        get_job_status_symbol(&step.status, &step.conclusion),
+                                        step.name
+                                    )
+                                });
+                                vec![format!(
+                                    "   {} {}",
+                                    get_job_status_symbol(&job.status, &job.conclusion),
+                                    job.name
+                                )]
+                                .into_iter()
+                                .chain(step_statuses)
+                                .collect::<Vec<_>>()
+                            })
+                            .collect(),
+                        Err(err) => {
+                            error!("{:?}", err);
+                            Vec::new()
+                        }
                     }
-                },
+                }
                 _ => Vec::new(),
             };
             WorkflowRun {
@@ -241,23 +247,44 @@ impl WorkflowRunsListWidget {
         Ok(details)
     }
 
-    async fn get_workflow_jobs(&self, run_id: RunId) -> Result<Page<Job>> {
-        let jobs = self
-            .client
-            .workflows(&self.repo_owner, &self.repo)
-            .list_jobs(run_id)
-            .send()
-            .await?;
+    async fn get_workflow_jobs(&self, run_id: RunId, is_completed: bool) -> Result<Vec<Job>> {
+        let existing_jobs = {
+            let state_guard = self.state.read().unwrap();
+            state_guard.completed_workflow_jobs.get(&run_id.0).cloned()
+        };
+        let jobs = match existing_jobs {
+            Some(jobs) => jobs,
+            None => {
+                info!("fetching jobs for workflow run {}", run_id.0);
+                let jobs = self
+                    .client
+                    .workflows(&self.repo_owner, &self.repo)
+                    .list_jobs(run_id)
+                    .send()
+                    .await?
+                    .items;
+                if is_completed {
+                    self.state
+                        .write()
+                        .unwrap()
+                        .completed_workflow_jobs
+                        .insert(run_id.0, jobs.clone());
+                }
+                jobs
+            }
+        };
         Ok(jobs)
     }
 
-    async fn get_workflow_runs(&self) -> Result<Page<Run>> {
+    async fn get_workflow_runs(&self) -> Result<Vec<Run>> {
+        info!("fetching workflow runs");
         let runs = self
             .client
             .workflows(&self.repo_owner, &self.repo)
             .list_all_runs()
             .send()
-            .await?;
+            .await?
+            .items;
         Ok(runs)
     }
 }
