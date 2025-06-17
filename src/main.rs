@@ -26,42 +26,43 @@ use unicode_width::UnicodeWidthStr;
 #[tokio::main]
 async fn main() -> Result<()> {
     let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "app.log");
-
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new("info"))
         .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
         .init();
+
     color_eyre::install()?;
     let terminal = ratatui::init();
-
-    // let token =
-    //     env::var("GITHUB_TOKEN").map_err(|_| eyre!("GITHUB_TOKEN environment variable not set"))?;
-
-    let origin_url = get_git_origin_url()?;
-
-    let (owner, _repo) = parse_github_repo(&origin_url)?;
-    let repo = "nixos".to_string();
-
-    let app_result = App::new(owner, repo).run(terminal).await;
+    let app_result = App::new().run(terminal).await;
     ratatui::restore();
     app_result
 }
 
 #[derive(Debug)]
 struct App {
-    should_quit: bool,
     workflow_runs: WorkflowRunsListWidget,
+    should_quit: bool,
 }
 
 impl App {
     const FRAMES_PER_SECOND: f32 = 60.0;
 
-    pub fn new(owner: String, repo: String) -> Self {
-        let workflow_runs = WorkflowRunsListWidget::default();
-        workflow_runs.set_repo(owner, repo);
+    pub fn new() -> Self {
+        let origin_url = get_git_origin_url().unwrap();
+        let (owner, _repo) = parse_github_repo(&origin_url).unwrap();
+        let repo = "nixos".to_string();
+
+        let token = env::var("GITHUB_TOKEN").unwrap();
+        let octocrab = octocrab::Octocrab::builder()
+            .personal_token(token.to_owned())
+            .build()
+            .unwrap();
+
+        let workflow_runs = WorkflowRunsListWidget::new(octocrab, owner, repo);
+
         Self {
-            should_quit: false,
             workflow_runs,
+            should_quit: false,
         }
     }
 
@@ -107,8 +108,6 @@ struct WorkflowRunsListState {
     constraint_lens: (u16, u16, u16, u16),
     loading_state: LoadingState,
     table_state: TableState,
-    repo_owner: String,
-    repo: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -120,12 +119,24 @@ enum LoadingState {
     Error(String),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct WorkflowRunsListWidget {
     state: Arc<RwLock<WorkflowRunsListState>>,
+    client: Octocrab,
+    repo_owner: String,
+    repo: String,
 }
 
 impl WorkflowRunsListWidget {
+    fn new(client: Octocrab, repo_owner: String, repo: String) -> Self {
+        Self {
+            state: Default::default(),
+            client,
+            repo_owner,
+            repo,
+        }
+    }
+
     fn run(&self) {
         let this = self.clone();
         tokio::spawn(this.fetch_runs());
@@ -134,10 +145,8 @@ impl WorkflowRunsListWidget {
     async fn fetch_runs(self) {
         let mut interval = interval(Duration::from_secs(10));
         loop {
-            let repo_owner = self.state.write().unwrap().repo_owner.clone();
-            let repo = self.state.write().unwrap().repo.clone();
             self.set_loading_state(LoadingState::Loading);
-            match get_all_workflow_runs(repo_owner, &repo).await {
+            match self.get_all_workflow_runs().await {
                 Ok(runs) => self.on_load(runs),
                 Err(err) => self.on_err(&err),
             }
@@ -163,17 +172,66 @@ impl WorkflowRunsListWidget {
         self.state.write().unwrap().loading_state = state;
     }
 
-    fn set_repo(&self, repo_owner: String, repo: String) {
-        self.state.write().unwrap().repo_owner = repo_owner;
-        self.state.write().unwrap().repo = repo;
-    }
-
     fn scroll_down(&self) {
         self.state.write().unwrap().table_state.scroll_down_by(1);
     }
 
     fn scroll_up(&self) {
         self.state.write().unwrap().table_state.scroll_up_by(1);
+    }
+
+    async fn get_all_workflow_runs(&self) -> Result<Vec<WorkflowRun>> {
+        let workflows = get_workflow_runs(&self.client, &self.repo_owner, &self.repo).await?;
+
+        let details_futures = workflows.items.into_iter().map(|run| async move {
+            let status = run.conclusion.as_ref().unwrap_or(&run.status);
+            let job_statuses = match status.as_str() {
+                "failure" | "in_progress" => {
+                    match get_workflow_jobs(
+                        &self.client,
+                        &self.repo_owner,
+                        &self.repo,
+                        run.id.clone(),
+                    )
+                    .await
+                    {
+                        Ok(jobs) => jobs
+                            .items
+                            .into_iter()
+                            .map(|job| {
+                                format!(
+                                    "     {} {}",
+                                    get_job_status_symbol(&job.status, &job.conclusion),
+                                    job.name
+                                )
+                            })
+                            .collect(),
+                        Err(err) => {
+                            warn!("{:?}", err);
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            };
+            WorkflowRun {
+                id: format!("{}", run.id.clone().0),
+                name: run.name.to_string(),
+                branch: run.head_branch.to_string(),
+                status: vec![format!(
+                    "{} {}",
+                    get_run_status_symbol(&run.status, &run.conclusion),
+                    status
+                )]
+                .into_iter()
+                .chain(job_statuses)
+                .collect(),
+                created_at: run.created_at,
+                html_url: run.html_url.clone().into(),
+            }
+        });
+        let details = futures::future::join_all(details_futures).await;
+        Ok(details)
     }
 }
 
@@ -183,7 +241,7 @@ impl Widget for &WorkflowRunsListWidget {
 
         let loading_state = Line::from(format!("{:?}", state.loading_state)).right_aligned();
         let block = Block::bordered()
-            .title(format!("{}/{}", state.repo_owner, state.repo))
+            .title(format!("{}/{}", self.repo_owner, self.repo))
             .title(loading_state)
             .title_bottom("j/k to scroll, q to quit");
 
@@ -225,63 +283,6 @@ impl Widget for &WorkflowRunsListWidget {
             StatefulWidget::render(table, area, buf, &mut state.table_state);
         }
     }
-}
-
-async fn get_all_workflow_runs(owner: String, repo: &str) -> Result<Vec<WorkflowRun>> {
-    let token =
-        env::var("GITHUB_TOKEN").map_err(|_| eyre!("GITHUB_TOKEN environment variable not set"))?;
-    let octocrab = octocrab::Octocrab::builder()
-        .personal_token(token.to_owned())
-        .build()?;
-
-    let workflows = get_workflow_runs(&octocrab, &owner, repo).await?;
-
-    let details_futures = workflows.items.into_iter().map(|run| {
-        let octocrab = octocrab.clone();
-        let owner = owner.clone();
-        async move {
-            let status = run.conclusion.as_ref().unwrap_or(&run.status);
-            let job_statuses = match status.as_str() {
-                "failure" | "in_progress" => {
-                    match get_workflow_jobs(&octocrab, &owner, repo, run.id.clone()).await {
-                        Ok(jobs) => jobs
-                            .items
-                            .into_iter()
-                            .map(|job| {
-                                format!(
-                                    "     {} {}",
-                                    get_job_status_symbol(&job.status, &job.conclusion),
-                                    job.name
-                                )
-                            })
-                            .collect(),
-                        Err(err) => {
-                            warn!("{:?}", err);
-                            Vec::new()
-                        }
-                    }
-                }
-                _ => Vec::new(),
-            };
-            WorkflowRun {
-                id: format!("{}", run.id.clone().0),
-                name: run.name.to_string(),
-                branch: run.head_branch.to_string(),
-                status: vec![format!(
-                    "{} {}",
-                    get_run_status_symbol(&run.status, &run.conclusion),
-                    status
-                )]
-                .into_iter()
-                .chain(job_statuses)
-                .collect(),
-                created_at: run.created_at,
-                html_url: run.html_url.clone().into(),
-            }
-        }
-    });
-    let details = futures::future::join_all(details_futures).await;
-    Ok(details)
 }
 
 async fn get_workflow_jobs(
