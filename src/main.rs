@@ -18,7 +18,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, HighlightSpacing, Paragraph, Row, Table, TableState};
 use tokio::time::interval;
 use tokio_stream::StreamExt;
-use tracing::warn;
+use tracing::error;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use unicode_width::UnicodeWidthStr;
@@ -181,7 +181,13 @@ impl WorkflowRunsListWidget {
     }
 
     async fn get_all_workflow_runs(&self) -> Result<Vec<WorkflowRun>> {
-        let workflows = get_workflow_runs(&self.client, &self.repo_owner, &self.repo).await?;
+        let workflows = match get_workflow_runs(&self.client, &self.repo_owner, &self.repo).await {
+            Ok(runs) => runs,
+            Err(err) => {
+                error!("{:?}", err);
+                return Err(err);
+            }
+        };
 
         let details_futures = workflows.items.into_iter().map(|run| async move {
             let status = run.conclusion.as_ref().unwrap_or(&run.status);
@@ -198,16 +204,26 @@ impl WorkflowRunsListWidget {
                         Ok(jobs) => jobs
                             .items
                             .into_iter()
-                            .map(|job| {
-                                format!(
-                                    "     {} {}",
+                            .flat_map(|job| {
+                                let step_statuses = job.steps.into_iter().map(|step| {
+                                    format!(
+                                        "      {} {}",
+                                        get_job_status_symbol(&step.status, &step.conclusion),
+                                        step.name
+                                    )
+                                });
+                                vec![format!(
+                                    "   {} {}",
                                     get_job_status_symbol(&job.status, &job.conclusion),
                                     job.name
-                                )
+                                )]
+                                .into_iter()
+                                .chain(step_statuses)
+                                .collect::<Vec<_>>()
                             })
                             .collect(),
                         Err(err) => {
-                            warn!("{:?}", err);
+                            error!("{:?}", err);
                             Vec::new()
                         }
                     }
