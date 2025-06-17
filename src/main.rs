@@ -97,6 +97,7 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
                 KeyCode::Char('j') | KeyCode::Down => self.workflow_runs.scroll_down(),
                 KeyCode::Char('k') | KeyCode::Up => self.workflow_runs.scroll_up(),
+                KeyCode::Enter => self.workflow_runs.open_selected_workflow(),
                 _ => {}
             }
         }
@@ -249,8 +250,8 @@ impl WorkflowRunsListWidget {
 
     async fn get_workflow_jobs(&self, run_id: RunId, is_completed: bool) -> Result<Vec<Job>> {
         let existing_jobs = {
-            let state_guard = self.state.read().unwrap();
-            state_guard.completed_workflow_jobs.get(&run_id.0).cloned()
+            let state = self.state.read().unwrap();
+            state.completed_workflow_jobs.get(&run_id.0).cloned()
         };
         let jobs = match existing_jobs {
             Some(jobs) => jobs,
@@ -287,6 +288,20 @@ impl WorkflowRunsListWidget {
             .items;
         Ok(runs)
     }
+
+    fn open_selected_workflow(&self) {
+        let state = self.state.read().unwrap();
+        if let Some(selected_index) = state.table_state.selected() {
+            if let Some(workflow_run) = state.workflow_runs.get(selected_index) {
+                let url = &workflow_run.html_url;
+                info!("Opening URL: {}", url);
+
+                if let Err(e) = webbrowser::open(url) {
+                    error!("Failed to open browser: {}", e);
+                }
+            }
+        }
+    }
 }
 
 impl Widget for &WorkflowRunsListWidget {
@@ -297,7 +312,7 @@ impl Widget for &WorkflowRunsListWidget {
         let block = Block::bordered()
             .title(format!("{}/{}", self.repo_owner, self.repo))
             .title(loading_state)
-            .title_bottom("j/k to scroll, q to quit");
+            .title_bottom("j/k to scroll, enter to open in browser, q to quit");
 
         if state.workflow_runs.is_empty() {
             let loading_message = match &state.loading_state {
