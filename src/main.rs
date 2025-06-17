@@ -146,7 +146,7 @@ impl WorkflowRunsListWidget {
         let mut interval = interval(Duration::from_secs(10));
         loop {
             self.set_loading_state(LoadingState::Loading);
-            match self.get_all_workflow_runs().await {
+            match self.get_detailed_workflow_runs().await {
                 Ok(runs) => self.on_load(runs),
                 Err(err) => self.on_err(&err),
             }
@@ -180,8 +180,8 @@ impl WorkflowRunsListWidget {
         self.state.write().unwrap().table_state.scroll_up_by(1);
     }
 
-    async fn get_all_workflow_runs(&self) -> Result<Vec<WorkflowRun>> {
-        let workflows = match get_workflow_runs(&self.client, &self.repo_owner, &self.repo).await {
+    async fn get_detailed_workflow_runs(&self) -> Result<Vec<WorkflowRun>> {
+        let workflows = match self.get_workflow_runs().await {
             Ok(runs) => runs,
             Err(err) => {
                 error!("{:?}", err);
@@ -192,42 +192,33 @@ impl WorkflowRunsListWidget {
         let details_futures = workflows.items.into_iter().map(|run| async move {
             let status = run.conclusion.as_ref().unwrap_or(&run.status);
             let job_statuses = match status.as_str() {
-                "failure" | "in_progress" => {
-                    match get_workflow_jobs(
-                        &self.client,
-                        &self.repo_owner,
-                        &self.repo,
-                        run.id.clone(),
-                    )
-                    .await
-                    {
-                        Ok(jobs) => jobs
-                            .items
+                "failure" | "in_progress" => match self.get_workflow_jobs(run.id).await {
+                    Ok(jobs) => jobs
+                        .items
+                        .into_iter()
+                        .flat_map(|job| {
+                            let step_statuses = job.steps.into_iter().map(|step| {
+                                format!(
+                                    "      {} {}",
+                                    get_job_status_symbol(&step.status, &step.conclusion),
+                                    step.name
+                                )
+                            });
+                            vec![format!(
+                                "   {} {}",
+                                get_job_status_symbol(&job.status, &job.conclusion),
+                                job.name
+                            )]
                             .into_iter()
-                            .flat_map(|job| {
-                                let step_statuses = job.steps.into_iter().map(|step| {
-                                    format!(
-                                        "      {} {}",
-                                        get_job_status_symbol(&step.status, &step.conclusion),
-                                        step.name
-                                    )
-                                });
-                                vec![format!(
-                                    "   {} {}",
-                                    get_job_status_symbol(&job.status, &job.conclusion),
-                                    job.name
-                                )]
-                                .into_iter()
-                                .chain(step_statuses)
-                                .collect::<Vec<_>>()
-                            })
-                            .collect(),
-                        Err(err) => {
-                            error!("{:?}", err);
-                            Vec::new()
-                        }
+                            .chain(step_statuses)
+                            .collect::<Vec<_>>()
+                        })
+                        .collect(),
+                    Err(err) => {
+                        error!("{:?}", err);
+                        Vec::new()
                     }
-                }
+                },
                 _ => Vec::new(),
             };
             WorkflowRun {
@@ -248,6 +239,26 @@ impl WorkflowRunsListWidget {
         });
         let details = futures::future::join_all(details_futures).await;
         Ok(details)
+    }
+
+    async fn get_workflow_jobs(&self, run_id: RunId) -> Result<Page<Job>> {
+        let jobs = self
+            .client
+            .workflows(&self.repo_owner, &self.repo)
+            .list_jobs(run_id)
+            .send()
+            .await?;
+        Ok(jobs)
+    }
+
+    async fn get_workflow_runs(&self) -> Result<Page<Run>> {
+        let runs = self
+            .client
+            .workflows(&self.repo_owner, &self.repo)
+            .list_all_runs()
+            .send()
+            .await?;
+        Ok(runs)
     }
 }
 
@@ -299,25 +310,6 @@ impl Widget for &WorkflowRunsListWidget {
             StatefulWidget::render(table, area, buf, &mut state.table_state);
         }
     }
-}
-
-async fn get_workflow_jobs(
-    client: &Octocrab,
-    owner: &str,
-    repo: &str,
-    run_id: RunId,
-) -> Result<Page<Job>> {
-    let jobs = client
-        .workflows(owner, repo)
-        .list_jobs(run_id)
-        .send()
-        .await?;
-    Ok(jobs)
-}
-
-async fn get_workflow_runs(client: &Octocrab, owner: &str, repo: &str) -> Result<Page<Run>> {
-    let runs = client.workflows(owner, repo).list_all_runs().send().await?;
-    Ok(runs)
 }
 
 #[allow(dead_code)]
