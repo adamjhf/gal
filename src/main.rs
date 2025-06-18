@@ -200,26 +200,49 @@ impl WorkflowRunsListWidget {
                         .get_workflow_jobs(run.id, run.status == "completed")
                         .await
                     {
-                        Ok(jobs) => jobs
-                            .into_iter()
-                            .flat_map(|job| {
-                                let step_statuses = job.steps.into_iter().map(|step| {
-                                    format!(
-                                        "      {} {}",
-                                        get_job_status_symbol(&step.status, &step.conclusion),
-                                        step.name
-                                    )
-                                });
-                                vec![format!(
-                                    "   {} {}",
-                                    get_job_status_symbol(&job.status, &job.conclusion),
-                                    job.name
-                                )]
-                                .into_iter()
-                                .chain(step_statuses)
-                                .collect::<Vec<_>>()
-                            })
-                            .collect(),
+                        Ok(jobs) => {
+                            let mut all_items = Vec::new();
+
+                            for (job_index, job) in jobs.iter().enumerate() {
+                                let is_last_job = job_index == jobs.len() - 1;
+                                let job_prefix = if is_last_job { "└─ " } else { "├─ " };
+
+                                let job_status =
+                                    get_job_status_symbol(&job.status, &job.conclusion);
+                                all_items.push(ColoredText::new(
+                                    job_prefix.into(),
+                                    format!("{} {}", job_status.symbol, job.name),
+                                    job_status.color,
+                                ));
+
+                                for (step_index, step) in job.steps.iter().enumerate() {
+                                    let is_last_step = step_index == job.steps.len() - 1;
+                                    let step_prefix = if is_last_job {
+                                        if is_last_step {
+                                            "   └─ "
+                                        } else {
+                                            "   ├─ "
+                                        }
+                                    } else {
+                                        if is_last_step {
+                                            "│  └─ "
+                                        } else {
+                                            "│  ├─ "
+                                        }
+                                    };
+
+                                    let status =
+                                        get_job_status_symbol(&step.status, &step.conclusion);
+                                    all_items.push(ColoredText::new(
+                                        step_prefix.into(),
+                                        format!("{} {}", status.symbol, step.name),
+                                        status.color,
+                                    ));
+                                }
+                            }
+
+                            all_items
+                        }
                         Err(err) => {
                             error!("{:?}", err);
                             Vec::new()
@@ -228,13 +251,14 @@ impl WorkflowRunsListWidget {
                 }
                 _ => Vec::new(),
             };
+            let run_status = get_run_status_symbol(&run.status, &run.conclusion);
             WorkflowRun {
                 id: format!("{}", run.id.clone().0),
                 branch: run.head_branch.to_string(),
-                details: vec![format!(
-                    "{} {}",
-                    get_run_status_symbol(&run.status, &run.conclusion),
-                    run.name,
+                details: vec![ColoredText::new(
+                    String::new(),
+                    format!("{} {}", run_status.symbol, run.name,),
+                    run_status.color,
                 )]
                 .into_iter()
                 .chain(job_statuses)
@@ -352,12 +376,29 @@ impl Widget for &WorkflowRunsListWidget {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ColoredText {
+    prefix: String,
+    text: String,
+    color: Color,
+}
+
+impl ColoredText {
+    fn new(prefix: String, text: String, color: Color) -> Self {
+        Self {
+            prefix,
+            text,
+            color,
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct WorkflowRun {
     id: String,
     branch: String,
-    details: Vec<String>,
+    details: Vec<ColoredText>,
     created_at: DateTime<Utc>,
     html_url: String,
 }
@@ -368,40 +409,66 @@ impl From<&WorkflowRun> for Row<'_> {
         Row::new(vec![
             Cell::from(run.id),
             Cell::from(run.branch),
-            Cell::from(run.details.join("\n")),
+            Cell::from(
+                run.details
+                    .into_iter()
+                    .map(|ct| {
+                        Line::from(vec![
+                            Span::styled(ct.prefix, Style::default().fg(Color::DarkGray)),
+                            Span::styled(ct.text, Style::default().fg(ct.color)),
+                        ])
+                    })
+                    .collect::<Vec<_>>(),
+            ),
         ])
         .height(runs.details.len() as u16)
     }
 }
 
-fn get_run_status_symbol(status: &String, conclusion: &Option<String>) -> &'static str {
-    match status.as_str() {
-        "in_progress" => "🔄",
-        "queued" => "⏳",
-        "completed" => match conclusion.as_ref().map(|s| s.as_str()) {
-            Some("success") => "✅",
-            Some("failure") => "❌",
-            Some("cancelled") => "🚫",
-            Some("skipped") => "⏭️",
-            _ => "🔘",
-        },
-        _ => "❓",
+struct StatusDisplay {
+    symbol: &'static str,
+    color: Color,
+}
+
+impl From<(&'static str, Color)> for StatusDisplay {
+    fn from(tuple: (&'static str, Color)) -> Self {
+        StatusDisplay {
+            symbol: tuple.0,
+            color: tuple.1,
+        }
     }
 }
 
-fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> &'static str {
-    match status {
-        Status::InProgress => "🔄",
-        Status::Queued => "⏳",
-        Status::Completed => match conclusion.as_ref() {
-            Some(Conclusion::Success) => "✅",
-            Some(Conclusion::Failure) => "❌",
-            Some(Conclusion::Cancelled) => "🚫",
-            Some(Conclusion::Skipped) => "⏭️",
-            _ => "🔘",
+fn get_run_status_symbol(status: &String, conclusion: &Option<String>) -> StatusDisplay {
+    match status.as_str() {
+        "in_progress" => ("⏵", Color::Yellow),
+        "queued" => ("⏸", Color::Blue),
+        "completed" => match conclusion.as_ref().map(|s| s.as_str()) {
+            Some("success") => ("✔", Color::Green),
+            Some("failure") => ("⚠", Color::Red),
+            Some("cancelled") => ("∅", Color::Gray),
+            Some("skipped") => ("⏭", Color::Magenta),
+            _ => ("⏺", Color::Green),
         },
-        _ => "❓",
+        _ => ("?", Color::Magenta),
     }
+    .into()
+}
+
+fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> StatusDisplay {
+    match status {
+        Status::InProgress => ("⏵", Color::Yellow),
+        Status::Queued => ("⏸", Color::Blue),
+        Status::Completed => match conclusion.as_ref() {
+            Some(Conclusion::Success) => ("✔", Color::Green),
+            Some(Conclusion::Failure) => ("⚠", Color::Red),
+            Some(Conclusion::Cancelled) => ("∅", Color::Gray),
+            Some(Conclusion::Skipped) => ("⏭", Color::Magenta),
+            _ => ("⏺", Color::Green),
+        },
+        _ => ("?", Color::Magenta),
+    }
+    .into()
 }
 
 // fn format_duration(started_at: &DateTime<Utc>, completed_at: &Option<DateTime<Utc>>) -> String {
@@ -424,7 +491,7 @@ fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> &'
 fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16) {
     let details_len = runs
         .iter()
-        .flat_map(|run| run.details.iter().map(|s| s.as_str()))
+        .flat_map(|run| run.details.iter().map(|s| s.text.as_str()))
         .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0);
