@@ -160,9 +160,10 @@ impl WorkflowRunsListWidget {
     fn on_load(&self, runs: Vec<WorkflowRun>) {
         let mut state = self.state.write().unwrap();
         state.loading_state = LoadingState::Loaded;
+        let was_empty = state.workflow_runs.is_empty();
         state.workflow_runs = runs;
         state.constraint_lens = constraint_lens(&state.workflow_runs);
-        if !state.workflow_runs.is_empty() {
+        if !state.workflow_runs.is_empty() && was_empty {
             state.table_state.select(Some(0));
         }
     }
@@ -369,7 +370,7 @@ impl Widget for &WorkflowRunsListWidget {
                 .header(header)
                 .highlight_spacing(HighlightSpacing::Always)
                 .highlight_symbol("> ")
-                .row_highlight_style(Style::new().on_dark_gray());
+                .row_highlight_style(Style::new().on_dark_gray().bold());
 
             StatefulWidget::render(table, area, buf, &mut state.table_state);
         }
