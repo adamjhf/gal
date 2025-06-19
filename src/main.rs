@@ -91,7 +91,7 @@ impl App {
     fn render(&self, frame: &mut Frame) {
         let vertical = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]);
         let [title_area, body_area] = vertical.areas(frame.area());
-        let title = Line::from("GitHub Actions Listener").centered().bold();
+        let title = Line::from("GitHub Actions Live").centered().bold();
         frame.render_widget(title, title_area);
         frame.render_widget(&self.workflow_runs, body_area);
     }
