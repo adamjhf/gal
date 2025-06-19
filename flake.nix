@@ -98,6 +98,7 @@
           packages = with pkgs; [
             bacon
             watchexec
+            cargo-watch
           ];
         };
 

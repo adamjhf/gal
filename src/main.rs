@@ -17,6 +17,7 @@ use octocrab::{
 use ratatui::DefaultTerminal;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, HighlightSpacing, Paragraph, Row, Table, TableState};
+use throbber_widgets_tui::{Throbber, ThrobberState};
 use tokio::time::interval;
 use tokio_stream::StreamExt;
 use tracing::{error, info};
@@ -47,6 +48,7 @@ struct App {
 
 impl App {
     const FRAMES_PER_SECOND: f32 = 60.0;
+    const THROBBER_FPS: f32 = 20.0;
 
     pub fn new() -> Self {
         let origin_url = get_git_origin_url().unwrap();
@@ -67,16 +69,19 @@ impl App {
         }
     }
 
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
+    pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         self.workflow_runs.run();
 
         let period = Duration::from_secs_f32(1.0 / Self::FRAMES_PER_SECOND);
+        let throbber_period = Duration::from_secs_f32(1.0 / Self::THROBBER_FPS);
         let mut interval = tokio::time::interval(period);
+        let mut throbber_interval = tokio::time::interval(throbber_period);
         let mut events = EventStream::new();
 
         while !self.should_quit {
             tokio::select! {
                 _ = interval.tick() => { terminal.draw(|frame| self.render(frame))?; },
+                _ = throbber_interval.tick() => self.workflow_runs.update_throbber(),
                 Some(Ok(event)) = events.next() => self.handle_event(&event),
             }
         }
@@ -118,6 +123,7 @@ struct WorkflowRunsListState {
     constraint_lens: (u16, u16, u16),
     loading_state: LoadingState,
     table_state: TableState,
+    throbber_state: ThrobberState,
     completed_workflow_jobs: HashMap<u64, Vec<Job>>,
 }
 
@@ -174,6 +180,13 @@ impl WorkflowRunsListWidget {
 
     fn set_loading_state(&self, state: LoadingState) {
         self.state.write().unwrap().loading_state = state;
+    }
+
+    fn update_throbber(&self) {
+        let mut state = self.state.write().unwrap();
+        if state.loading_state == LoadingState::Loading {
+            state.throbber_state.calc_next();
+        }
     }
 
     fn scroll_down(&self) {
@@ -332,11 +345,22 @@ impl Widget for &WorkflowRunsListWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let mut state = self.state.write().unwrap();
 
-        let loading_state = Line::from(format!("{:?}", state.loading_state)).right_aligned();
-        let block = Block::bordered()
+        let mut block = Block::bordered()
             .title(format!("{}/{}", self.repo_owner, self.repo))
-            .title(loading_state)
             .title_bottom("j/k to scroll, enter to open in browser, q to quit");
+
+        block = match &state.loading_state {
+            LoadingState::Loading => {
+                let throbber = Throbber::default().throbber_set(throbber_widgets_tui::BRAILLE_ONE);
+                let throbber_span = throbber.to_symbol_span(&state.throbber_state);
+                let throbber_text = throbber_span.content.as_ref().trim_end().to_string();
+                block.title(Line::from(throbber_text).right_aligned())
+            }
+            LoadingState::Error(err) => {
+                block.title(Line::from(format!("Error: {:?}", err)).right_aligned())
+            }
+            _ => block,
+        };
 
         if state.workflow_runs.is_empty() {
             let loading_message = match &state.loading_state {
