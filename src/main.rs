@@ -20,16 +20,16 @@ use ratatui::widgets::{Block, Cell, HighlightSpacing, Paragraph, Row, Table, Tab
 use throbber_widgets_tui::{Throbber, ThrobberState};
 use tokio::time::interval;
 use tokio_stream::StreamExt;
-use tracing::{error, info};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing::{debug, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use unicode_width::UnicodeWidthStr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "app.log");
+    let (file_appender, _guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::never("logs", "app.log"));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(tracing_subscriber::EnvFilter::new("gal=info,warn"))
         .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
         .init();
 
@@ -293,7 +293,7 @@ impl WorkflowRunsListWidget {
         let jobs = match existing_jobs {
             Some(jobs) => jobs,
             None => {
-                info!("fetching jobs for workflow run {}", run_id.0);
+                debug!("fetching jobs for workflow run {}", run_id.0);
                 let jobs = self
                     .client
                     .workflows(&self.repo_owner, &self.repo)
@@ -315,7 +315,7 @@ impl WorkflowRunsListWidget {
     }
 
     async fn get_workflow_runs(&self) -> Result<Vec<Run>> {
-        info!("fetching workflow runs");
+        debug!("fetching workflow runs");
         let runs = self
             .client
             .workflows(&self.repo_owner, &self.repo)
@@ -331,7 +331,7 @@ impl WorkflowRunsListWidget {
         if let Some(selected_index) = state.table_state.selected() {
             if let Some(workflow_run) = state.workflow_runs.get(selected_index) {
                 let url = &workflow_run.html_url;
-                info!("Opening URL: {}", url);
+                debug!("opening URL: {}", url);
 
                 if let Err(e) = webbrowser::open(url) {
                     error!("Failed to open browser: {}", e);
