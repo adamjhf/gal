@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     let (file_appender, _guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::never("logs", "app.log"));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("gal=debug,warn"))
+        .with(tracing_subscriber::EnvFilter::new("gal=info,warn"))
         .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
         .init();
 
