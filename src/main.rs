@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::{cmp, env};
 
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use color_eyre::{Result, eyre::ErrReport, eyre::eyre};
 use crossterm::event::{Event, EventStream, KeyCode};
-use futures::future::join_all;
+use futures::future::{join_all, try_join_all};
 use octocrab::{
     Octocrab,
     models::{
@@ -25,8 +27,68 @@ use tracing::{debug, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use unicode_width::UnicodeWidthStr;
 
+#[derive(Parser)]
+#[command(version)]
+#[command(about = "Monitor GitHub Action workflow runs in the terminal")]
+struct Args {
+    /// GitHub repository in owner/repo format (defaults to origin of current git repo)
+    #[arg(short, long)]
+    repo: Option<GitHubRepo>,
+
+    /// Filter to specific branches (defaults to all branches)
+    #[arg(short, long, value_delimiter = ',')]
+    branch: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct GitHubRepo {
+    owner: String,
+    name: String,
+}
+
+impl GitHubRepo {
+    pub fn new(owner: String, name: String) -> Self {
+        Self { owner, name }
+    }
+
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+}
+
+impl FromStr for GitHubRepo {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('/').collect();
+
+        if parts.len() != 2 {
+            return Err("Repository must be in 'owner/repo' format".to_string());
+        }
+
+        let owner = parts[0].trim();
+        let name = parts[1].trim();
+
+        if owner.is_empty() {
+            return Err("Owner name cannot be empty".to_string());
+        }
+        if name.is_empty() {
+            return Err("Repository name cannot be empty".to_string());
+        }
+
+        Ok(GitHubRepo::new(owner.to_string(), name.to_string()))
+    }
+}
+
+impl std::fmt::Display for GitHubRepo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.owner, self.name)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
     let (file_appender, _guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::never("logs", "app.log"));
     tracing_subscriber::registry()
@@ -36,7 +98,7 @@ async fn main() -> Result<()> {
 
     color_eyre::install()?;
     let terminal = ratatui::init();
-    let app_result = App::new().run(terminal).await;
+    let app_result = App::new(args).run(terminal).await;
     ratatui::restore();
     app_result
 }
@@ -51,10 +113,11 @@ impl App {
     const FRAMES_PER_SECOND: f32 = 60.0;
     const THROBBER_FPS: f32 = 20.0;
 
-    pub fn new() -> Self {
-        let origin_url = get_git_origin_url().unwrap();
-        let (owner, _repo) = parse_github_repo(&origin_url).unwrap();
-        let repo = "nixos".to_string();
+    pub fn new(args: Args) -> Self {
+        let repo = match args.repo {
+            Some(repo) => repo,
+            None => parse_github_repo(&get_git_origin_url().unwrap()).unwrap(),
+        };
 
         let token = env::var("GITHUB_TOKEN").unwrap();
         let octocrab = octocrab::Octocrab::builder()
@@ -62,7 +125,7 @@ impl App {
             .build()
             .unwrap();
 
-        let workflow_runs = WorkflowRunsListWidget::new(octocrab, owner, repo);
+        let workflow_runs = WorkflowRunsListWidget::new(octocrab, repo, args.branch);
 
         Self {
             workflow_runs,
@@ -118,8 +181,8 @@ impl App {
 struct WorkflowRunsListWidget {
     state: Arc<RwLock<WorkflowRunsListState>>,
     client: Octocrab,
-    repo_owner: String,
-    repo: String,
+    repo: GitHubRepo,
+    branches: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -142,12 +205,12 @@ enum LoadingState {
 }
 
 impl WorkflowRunsListWidget {
-    fn new(client: Octocrab, repo_owner: String, repo: String) -> Self {
+    fn new(client: Octocrab, repo: GitHubRepo, branches: Option<Vec<String>>) -> Self {
         Self {
             state: Default::default(),
             client,
-            repo_owner,
             repo,
+            branches,
         }
     }
 
@@ -301,7 +364,7 @@ impl WorkflowRunsListWidget {
                 debug!("fetching jobs for workflow run {}", run_id.0);
                 let jobs = self
                     .client
-                    .workflows(&self.repo_owner, &self.repo)
+                    .workflows(&self.repo.owner, &self.repo.name)
                     .list_jobs(run_id)
                     .send()
                     .await?
@@ -321,13 +384,29 @@ impl WorkflowRunsListWidget {
 
     async fn get_workflow_runs(&self) -> Result<Vec<Run>> {
         debug!("fetching workflow runs");
-        let runs = self
-            .client
-            .workflows(&self.repo_owner, &self.repo)
-            .list_all_runs()
-            .send()
-            .await?
-            .items;
+        let runs = match &self.branches {
+            Some(branches) => {
+                let futures = branches.iter().map(|branch| async move {
+                    self.client
+                        .workflows(&self.repo.owner, &self.repo.name)
+                        .list_all_runs()
+                        .branch(branch)
+                        .send()
+                        .await
+                        .map(|resp| resp.items)
+                });
+                let results = try_join_all(futures).await?;
+                results.into_iter().flatten().collect()
+            }
+            None => {
+                self.client
+                    .workflows(&self.repo.owner, &self.repo.name)
+                    .list_all_runs()
+                    .send()
+                    .await?
+                    .items
+            }
+        };
         Ok(runs)
     }
 
@@ -381,7 +460,7 @@ impl Widget for &WorkflowRunsListWidget {
         let mut state = self.state.write().unwrap();
 
         let mut block = Block::bordered()
-            .title(format!("{}/{}", self.repo_owner, self.repo))
+            .title(self.repo.full_name())
             .title_bottom("j/k to scroll, enter to open in browser, q to quit");
 
         block = match &state.loading_state {
@@ -688,7 +767,7 @@ fn get_git_origin_url() -> Result<String> {
     Ok(url)
 }
 
-fn parse_github_repo(url: &str) -> Result<(String, String)> {
+fn parse_github_repo(url: &str) -> Result<GitHubRepo> {
     let cleaned_url = if url.starts_with("git@github.com:") {
         url.strip_prefix("git@github.com:")
             .ok_or(eyre!("Invalid SSH URL format"))?
@@ -706,7 +785,7 @@ fn parse_github_repo(url: &str) -> Result<(String, String)> {
         return Err(eyre!("Invalid repository path format. Expected owner/repo"));
     }
 
-    Ok((parts[0].to_string(), parts[1].to_string()))
+    Ok(GitHubRepo::new(parts[0].to_string(), parts[1].to_string()))
 }
 
 // async fn get_job_logs(
