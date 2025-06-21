@@ -1,11 +1,11 @@
 use std::collections::HashMap;
+use std::env;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use std::{cmp, env};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use clap::Parser;
 use color_eyre::{Result, eyre::ErrReport, eyre::eyre};
 use crossterm::event::{Event, EventStream, KeyCode};
@@ -184,7 +184,6 @@ struct WorkflowRunsListWidget {
 #[derive(Debug, Default)]
 struct WorkflowRunsListState {
     workflow_runs: Vec<WorkflowRun>,
-    constraint_lens: (u16, u16, u16),
     loading_state: LoadingState,
     table_state: TableState,
     throbber_state: ThrobberState,
@@ -234,7 +233,6 @@ impl WorkflowRunsListWidget {
         state.loading_state = LoadingState::Loaded;
         let was_empty = state.workflow_runs.is_empty();
         state.workflow_runs = runs;
-        state.constraint_lens = constraint_lens(&state.workflow_runs);
         if !state.workflow_runs.is_empty() && was_empty {
             state.table_state.select(Some(0));
         }
@@ -451,6 +449,26 @@ impl WorkflowRunsListWidget {
             }
         }
     }
+
+    fn calculate_column_widths(&self, headers: &[&str], rows: &Vec<RunRow>) -> Vec<Constraint> {
+        let mut max_widths = headers
+            .iter()
+            .take(3)
+            .map(|h| UnicodeWidthStr::width(*h))
+            .collect::<Vec<_>>();
+
+        for row in rows {
+            max_widths[0] = max_widths[0].max(UnicodeWidthStr::width(row.id.as_str()));
+            max_widths[1] = max_widths[1].max(UnicodeWidthStr::width(row.time.as_str()));
+            max_widths[2] = max_widths[2].max(UnicodeWidthStr::width(row.branch.as_str()));
+        }
+
+        max_widths
+            .into_iter()
+            .map(|mw| Constraint::Length(mw as u16 + 1))
+            .chain(std::iter::once(Constraint::Min(20)))
+            .collect()
+    }
 }
 
 impl Widget for &WorkflowRunsListWidget {
@@ -489,7 +507,8 @@ impl Widget for &WorkflowRunsListWidget {
 
             paragraph.render(area, buf);
         } else {
-            let header = ["ID", "Branch", "Run"]
+            let headers = ["ID", "Time", "Branch", "Run"];
+            let header = headers
                 .into_iter()
                 .map(Cell::from)
                 .collect::<Row>()
@@ -498,34 +517,38 @@ impl Widget for &WorkflowRunsListWidget {
             let max_height = area.height as i32 - 3; // 1 header and 2 border
             let offset = state.table_state.offset();
             let mut consumed_height = 0;
-            let rows = state.workflow_runs.iter().enumerate().map(|(i, run)| {
-                let row_height: i32 = match (run.show_jobs, &run.jobs) {
-                    (false, _) => 1,
-                    (true, JobsState::Loaded(jobs)) => {
-                        jobs.iter().map(|job| job.steps.len() + 1).sum::<usize>() as i32 + 1
-                    }
-                    _ => 2,
-                };
-
-                let visible_height = if i < offset {
-                    row_height
-                } else if consumed_height < max_height && consumed_height + row_height > max_height
-                {
-                    let partial_height = max_height - consumed_height;
-                    consumed_height = max_height;
-                    partial_height
-                } else {
-                    consumed_height += row_height;
-                    row_height
-                };
-                let row: Row = run.into();
-                row.height(visible_height as u16)
-            });
-            let widths = [
-                Constraint::Length(state.constraint_lens.0 + 1),
-                Constraint::Length(cmp::max(state.constraint_lens.1 + 1, 7)),
-                Constraint::Fill(1),
-            ];
+            let run_rows = state
+                .workflow_runs
+                .iter()
+                .map(|run| run.to_row())
+                .collect::<Vec<_>>();
+            let widths = self.calculate_column_widths(&headers, &run_rows);
+            let rows = run_rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, run)| {
+                    let row_height = run.details_lines.len() as i32;
+                    let visible_height = if i < offset {
+                        row_height
+                    } else if consumed_height < max_height
+                        && consumed_height + row_height > max_height
+                    {
+                        let partial_height = max_height - consumed_height;
+                        consumed_height = max_height;
+                        partial_height
+                    } else {
+                        consumed_height += row_height;
+                        row_height
+                    };
+                    let row: Row = Row::new(vec![
+                        Cell::from(run.id),
+                        Cell::from(run.time),
+                        Cell::from(run.branch),
+                        Cell::from(run.details_lines),
+                    ]);
+                    row.height(visible_height as u16)
+                })
+                .collect::<Vec<_>>();
             let table = Table::new(rows, widths)
                 .block(block)
                 .header(header)
@@ -577,9 +600,9 @@ enum JobsState {
     LoadingError(String),
 }
 
-impl From<&WorkflowRun> for Row<'_> {
-    fn from(run: &WorkflowRun) -> Self {
-        let run = run.clone();
+impl WorkflowRun {
+    fn to_row<'a, 'b>(&'a self) -> RunRow<'b> {
+        let run = self;
 
         let mut details_lines = vec![{
             let status_symbol = get_run_status_symbol(&run.status, &run.conclusion);
@@ -589,7 +612,7 @@ impl From<&WorkflowRun> for Row<'_> {
             )
         }];
         if run.show_jobs {
-            let jobs_details = match run.jobs {
+            let jobs_details = match &run.jobs {
                 JobsState::NotLoaded => vec![Line::from("  Jobs not loaded")],
                 JobsState::Loading => vec![Line::from("  Loading jobs...")],
                 JobsState::LoadingError(err) => {
@@ -647,15 +670,21 @@ impl From<&WorkflowRun> for Row<'_> {
             };
             details_lines.extend(jobs_details);
         };
-        let height = details_lines.len();
 
-        Row::new(vec![
-            Cell::from(run.id.0.to_string()),
-            Cell::from(run.branch),
-            Cell::from(details_lines),
-        ])
-        .height(height as u16)
+        RunRow {
+            id: run.id.0.to_string(),
+            time: format_relative_time(run.created_at),
+            branch: run.branch.clone(),
+            details_lines,
+        }
     }
+}
+
+struct RunRow<'a> {
+    id: String,
+    time: String,
+    branch: String,
+    details_lines: Vec<Line<'a>>,
 }
 
 struct StatusDisplay {
@@ -721,28 +750,6 @@ fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> St
 //     }
 // }
 
-fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16) {
-    let details_len = 0; //runs
-    // .iter()
-    // .flat_map(|run| run.details.iter().map(|s| s.text.as_str()))
-    // .map(UnicodeWidthStr::width)
-    // .max()
-    // .unwrap_or(0);
-    let id_len = runs
-        .iter()
-        .map(|run| run.id.0.to_string())
-        .map(|id| UnicodeWidthStr::width(id.as_str()))
-        .max()
-        .unwrap_or(0);
-    let branch_len = runs
-        .iter()
-        .map(|run| run.branch.as_str())
-        .map(UnicodeWidthStr::width)
-        .max()
-        .unwrap_or(0);
-    (id_len as u16, branch_len as u16, details_len as u16)
-}
-
 fn get_git_origin_url() -> Result<String> {
     let output = Command::new("git")
         .args(["config", "--get", "remote.origin.url"])
@@ -784,6 +791,52 @@ fn parse_github_repo(url: &str) -> Result<GitHubRepo> {
     }
 
     Ok(GitHubRepo::new(parts[0].to_string(), parts[1].to_string()))
+}
+
+fn format_relative_time(dt: DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let diff = now.signed_duration_since(dt);
+
+    let seconds = diff.num_seconds();
+    let days = diff.num_days();
+
+    match seconds {
+        0..=59 => format!("{}s ago", seconds),
+        60..=3599 => format!("{}m ago", diff.num_minutes()),
+        3600..=86399 => format!("{}h ago", diff.num_hours()),
+        86400..=604799 => {
+            // 1-6 days
+            match days {
+                1 => "yesterday".to_string(),
+                _ => format!("{}d ago", days),
+            }
+        }
+        604800..=3023999 => {
+            // 1-4 weeks
+            let weeks = days / 7;
+            match weeks {
+                1 => "last week".to_string(),
+                _ => format!("{}w ago", weeks),
+            }
+        }
+        _ => {
+            let mut years = now.year() - dt.year();
+            let mut months = now.month0() as i32 - dt.month0() as i32;
+            if now.day() < dt.day() {
+                months -= 1;
+            }
+            if months < 0 {
+                years -= 1;
+                months += 12;
+            }
+            match (years, months) {
+                (0, 1) => "last month".to_string(),
+                (0, months) => format!("{months}mo ago"),
+                (1, _) => "last year".to_string(),
+                (years, _) => format!("{years}y ago"),
+            }
+        }
+    }
 }
 
 // async fn get_job_logs(
