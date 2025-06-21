@@ -7,6 +7,7 @@ use std::{cmp, env};
 use chrono::{DateTime, Utc};
 use color_eyre::{Result, eyre::ErrReport, eyre::eyre};
 use crossterm::event::{Event, EventStream, KeyCode};
+use futures::future::join_all;
 use octocrab::{
     Octocrab,
     models::{
@@ -147,23 +148,25 @@ impl WorkflowRunsListWidget {
     }
 
     fn run(&self) {
-        let this = self.clone();
+        let this = Arc::new(self.clone());
         tokio::spawn(this.fetch_runs());
     }
 
-    async fn fetch_runs(self) {
+    async fn fetch_runs(self: Arc<Self>) {
         let mut interval = interval(Duration::from_secs(10));
         loop {
             self.set_loading_state(LoadingState::Loading);
+            let this = self.clone();
             match self.get_detailed_workflow_runs().await {
-                Ok(runs) => self.on_load(runs),
+                Ok(runs) => this.on_load(runs),
                 Err(err) => self.on_err(&err),
             }
             interval.tick().await;
         }
     }
 
-    fn on_load(&self, runs: Vec<WorkflowRun>) {
+    fn on_load(self: Arc<Self>, runs: Vec<WorkflowRun>) {
+        let this = self.clone();
         let mut state = self.state.write().unwrap();
         state.loading_state = LoadingState::Loaded;
         let was_empty = state.workflow_runs.is_empty();
@@ -171,6 +174,44 @@ impl WorkflowRunsListWidget {
         state.constraint_lens = constraint_lens(&state.workflow_runs);
         if !state.workflow_runs.is_empty() && was_empty {
             state.table_state.select(Some(0));
+        }
+        tokio::spawn(this.load_jobs());
+    }
+
+    async fn load_jobs(self: Arc<Self>) {
+        let runs = {
+            let mut state = self.state.write().unwrap();
+            state
+                .workflow_runs
+                .iter_mut()
+                .filter(|run| {
+                    run.show_jobs
+                        && (run.status.as_str() == "in_progress"
+                            || !matches!(run.jobs, JobsState::Loaded(_)))
+                })
+                .map(|run| {
+                    run.jobs = JobsState::Loading;
+                    (run.id, run.status == "completed")
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let futures = runs.into_iter().map(|run| {
+            let this = self.clone();
+            async move {
+                match this.get_workflow_jobs(run.0, run.1).await {
+                    Ok(jobs) => (run.0, JobsState::Loaded(jobs)),
+                    Err(err) => (run.0, JobsState::LoadingError(err.to_string())),
+                }
+            }
+        });
+        let jobs_states = join_all(futures).await;
+
+        let mut state = self.state.write().unwrap();
+        for (id, jobs_state) in jobs_states {
+            if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == id) {
+                run.jobs = jobs_state;
+            }
         }
     }
 
@@ -207,76 +248,23 @@ impl WorkflowRunsListWidget {
         };
 
         let details_futures = workflows.into_iter().map(|run| async move {
-            let status = run.conclusion.as_ref().unwrap_or(&run.status);
-            let job_statuses = match status.as_str() {
-                "failure" | "in_progress" => {
-                    match self
-                        .get_workflow_jobs(run.id, run.status == "completed")
-                        .await
-                    {
-                        Ok(jobs) => {
-                            let mut all_items = Vec::new();
-
-                            for (job_index, job) in jobs.iter().enumerate() {
-                                let is_last_job = job_index == jobs.len() - 1;
-                                let job_prefix = if is_last_job { "└─ " } else { "├─ " };
-
-                                let job_status =
-                                    get_job_status_symbol(&job.status, &job.conclusion);
-                                all_items.push(ColoredText::new(
-                                    job_prefix.into(),
-                                    format!("{} {}", job_status.symbol, job.name),
-                                    job_status.color,
-                                ));
-
-                                for (step_index, step) in job.steps.iter().enumerate() {
-                                    let is_last_step = step_index == job.steps.len() - 1;
-                                    let step_prefix = if is_last_job {
-                                        if is_last_step {
-                                            "   └─ "
-                                        } else {
-                                            "   ├─ "
-                                        }
-                                    } else {
-                                        if is_last_step {
-                                            "│  └─ "
-                                        } else {
-                                            "│  ├─ "
-                                        }
-                                    };
-
-                                    let status =
-                                        get_job_status_symbol(&step.status, &step.conclusion);
-                                    all_items.push(ColoredText::new(
-                                        step_prefix.into(),
-                                        format!("{} {}", status.symbol, step.name),
-                                        status.color,
-                                    ));
-                                }
-                            }
-
-                            all_items
-                        }
-                        Err(err) => {
-                            error!("{:?}", err);
-                            Vec::new()
-                        }
-                    }
-                }
-                _ => Vec::new(),
+            let show_jobs = match run
+                .conclusion
+                .clone()
+                .unwrap_or(run.status.clone())
+                .as_str()
+            {
+                "failure" | "in_progress" => true,
+                _ => false,
             };
-            let run_status = get_run_status_symbol(&run.status, &run.conclusion);
             WorkflowRun {
-                id: format!("{}", run.id.clone().0),
+                id: run.id,
+                name: run.name,
                 branch: run.head_branch.to_string(),
-                details: vec![ColoredText::new(
-                    String::new(),
-                    format!("{} {}", run_status.symbol, run.name,),
-                    run_status.color,
-                )]
-                .into_iter()
-                .chain(job_statuses)
-                .collect(),
+                status: run.status,
+                conclusion: run.conclusion,
+                show_jobs,
+                jobs: JobsState::NotLoaded,
                 created_at: run.created_at,
                 html_url: run.html_url.clone().into(),
             }
@@ -418,35 +406,106 @@ impl ColoredText {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct WorkflowRun {
-    id: String,
+    id: RunId,
+    name: String,
     branch: String,
-    details: Vec<ColoredText>,
+    status: String,
+    conclusion: Option<String>,
+    jobs: JobsState,
+    show_jobs: bool,
+    #[allow(dead_code)]
     created_at: DateTime<Utc>,
     html_url: String,
 }
 
+#[derive(Debug, Clone)]
+enum JobsState {
+    NotLoaded,
+    Loading,
+    Loaded(Vec<Job>),
+    LoadingError(String),
+}
+
 impl From<&WorkflowRun> for Row<'_> {
-    fn from(runs: &WorkflowRun) -> Self {
-        let run = runs.clone();
+    fn from(run: &WorkflowRun) -> Self {
+        let run = run.clone();
+
+        let mut details_lines = vec![{
+            let status_symbol = get_run_status_symbol(&run.status, &run.conclusion);
+            Line::styled(
+                format!("{} {}", status_symbol.symbol, run.name),
+                Style::default().fg(status_symbol.color),
+            )
+        }];
+        if run.show_jobs {
+            let jobs_details = match run.jobs {
+                JobsState::NotLoaded => vec![Line::from("Jobs not loaded")],
+                JobsState::Loading => vec![Line::from("Loading jobs...")],
+                JobsState::LoadingError(err) => {
+                    vec![Line::from(format!("Error loading jobs: {:?}", err))]
+                }
+                JobsState::Loaded(jobs) => {
+                    let mut all_items = Vec::new();
+
+                    for (job_index, job) in jobs.iter().enumerate() {
+                        let is_last_job = job_index == jobs.len() - 1;
+                        let job_prefix = if is_last_job { "└─ " } else { "├─ " };
+
+                        let job_status = get_job_status_symbol(&job.status, &job.conclusion);
+                        all_items.push(ColoredText::new(
+                            job_prefix.into(),
+                            format!("{} {}", job_status.symbol, job.name),
+                            job_status.color,
+                        ));
+
+                        for (step_index, step) in job.steps.iter().enumerate() {
+                            let is_last_step = step_index == job.steps.len() - 1;
+                            let step_prefix = if is_last_job {
+                                if is_last_step {
+                                    "   └─ "
+                                } else {
+                                    "   ├─ "
+                                }
+                            } else {
+                                if is_last_step {
+                                    "│  └─ "
+                                } else {
+                                    "│  ├─ "
+                                }
+                            };
+
+                            let status = get_job_status_symbol(&step.status, &step.conclusion);
+                            all_items.push(ColoredText::new(
+                                step_prefix.into(),
+                                format!("{} {}", status.symbol, step.name),
+                                status.color,
+                            ));
+                        }
+                    }
+
+                    all_items
+                        .into_iter()
+                        .map(|ct| {
+                            Line::from(vec![
+                                Span::styled(ct.prefix, Style::default().fg(Color::DarkGray)),
+                                Span::styled(ct.text, Style::default().fg(ct.color)),
+                            ])
+                        })
+                        .collect::<Vec<_>>()
+                }
+            };
+            details_lines.extend(jobs_details);
+        };
+        let height = details_lines.len();
+
         Row::new(vec![
-            Cell::from(run.id),
+            Cell::from(run.id.0.to_string()),
             Cell::from(run.branch),
-            Cell::from(
-                run.details
-                    .into_iter()
-                    .map(|ct| {
-                        Line::from(vec![
-                            Span::styled(ct.prefix, Style::default().fg(Color::DarkGray)),
-                            Span::styled(ct.text, Style::default().fg(ct.color)),
-                        ])
-                    })
-                    .collect::<Vec<_>>(),
-            ),
+            Cell::from(details_lines),
         ])
-        .height(runs.details.len() as u16)
+        .height(height as u16)
     }
 }
 
@@ -514,16 +573,16 @@ fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> St
 // }
 
 fn constraint_lens(runs: &[WorkflowRun]) -> (u16, u16, u16) {
-    let details_len = runs
-        .iter()
-        .flat_map(|run| run.details.iter().map(|s| s.text.as_str()))
-        .map(UnicodeWidthStr::width)
-        .max()
-        .unwrap_or(0);
+    let details_len = 0; //runs
+    // .iter()
+    // .flat_map(|run| run.details.iter().map(|s| s.text.as_str()))
+    // .map(UnicodeWidthStr::width)
+    // .max()
+    // .unwrap_or(0);
     let id_len = runs
         .iter()
-        .map(|run| run.id.as_str())
-        .map(UnicodeWidthStr::width)
+        .map(|run| run.id.0.to_string())
+        .map(|id| UnicodeWidthStr::width(id.as_str()))
         .max()
         .unwrap_or(0);
     let branch_len = runs
