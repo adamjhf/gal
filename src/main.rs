@@ -250,27 +250,40 @@ impl WorkflowRunsListWidget {
                 return Err(err);
             }
         };
-
-        let details_futures = workflows.into_iter().map(|run| async move {
-            let show_jobs = match run
-                .conclusion
-                .clone()
-                .unwrap_or(run.status.clone())
-                .as_str()
-            {
-                "failure" | "in_progress" => true,
-                _ => false,
-            };
-            WorkflowRun {
-                id: run.id,
-                name: run.name,
-                branch: run.head_branch.to_string(),
-                status: run.status,
-                conclusion: run.conclusion,
-                show_jobs,
-                jobs: JobsState::NotLoaded,
-                created_at: run.created_at,
-                html_url: run.html_url.clone().into(),
+        let existing_workflow_runs = Arc::new({
+            let state = self.state.read().unwrap();
+            state
+                .workflow_runs
+                .iter()
+                .map(|run| (run.id, run.show_jobs))
+                .collect::<HashMap<RunId, bool>>()
+        });
+        let details_futures = workflows.into_iter().map(|run| {
+            let existing_workflow_runs = existing_workflow_runs.clone();
+            async move {
+                let show_jobs = match run
+                    .conclusion
+                    .clone()
+                    .unwrap_or(run.status.clone())
+                    .as_str()
+                {
+                    "failure" | "in_progress" => true,
+                    _ => false,
+                };
+                WorkflowRun {
+                    id: run.id,
+                    name: run.name,
+                    branch: run.head_branch.to_string(),
+                    status: run.status,
+                    conclusion: run.conclusion,
+                    show_jobs: match existing_workflow_runs.get(&run.id) {
+                        Some(existing) => *existing,
+                        None => show_jobs,
+                    },
+                    jobs: JobsState::NotLoaded,
+                    created_at: run.created_at,
+                    html_url: run.html_url.clone().into(),
+                }
             }
         });
         let details = futures::future::join_all(details_futures).await;
