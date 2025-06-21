@@ -396,7 +396,9 @@ impl WorkflowRunsListWidget {
                         .map(|resp| resp.items)
                 });
                 let results = try_join_all(futures).await?;
-                results.into_iter().flatten().collect()
+                let mut runs = results.into_iter().flatten().collect::<Vec<_>>();
+                runs.sort_unstable_by(|a, b| b.id.0.cmp(&a.id.0));
+                runs
             }
             None => {
                 self.client
