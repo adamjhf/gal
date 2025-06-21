@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     let (file_appender, _guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::never("logs", "app.log"));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("gal=info,warn"))
+        .with(tracing_subscriber::EnvFilter::new("gal=debug,warn"))
         .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
         .init();
 
@@ -104,6 +104,10 @@ impl App {
                 KeyCode::Char('j') | KeyCode::Down => self.workflow_runs.scroll_down(),
                 KeyCode::Char('k') | KeyCode::Up => self.workflow_runs.scroll_up(),
                 KeyCode::Enter => self.workflow_runs.open_selected_workflow(),
+                KeyCode::Char(' ') => {
+                    let runs = Arc::new(self.workflow_runs.clone());
+                    runs.toggle_selected_workflow()
+                }
                 _ => {}
             }
         }
@@ -314,11 +318,41 @@ impl WorkflowRunsListWidget {
         Ok(runs)
     }
 
+    fn toggle_selected_workflow(self: Arc<Self>) {
+        let mut state = self.state.write().unwrap();
+        if let Some(selected_index) = state.table_state.selected() {
+            if let Some(run) = state.workflow_runs.get_mut(selected_index) {
+                let this = self.clone();
+                let run_id = run.id;
+                let is_completed = run.status.as_str() == "completed";
+                run.show_jobs = !run.show_jobs;
+                if run.show_jobs {
+                    if run.jobs == JobsState::NotLoaded {
+                        run.jobs = JobsState::Loading;
+                    }
+                    let state_arc = self.state.clone();
+                    tokio::spawn(async move {
+                        let jobs_state = match this.get_workflow_jobs(run_id, is_completed).await {
+                            Ok(jobs) => JobsState::Loaded(jobs),
+                            Err(err) => JobsState::LoadingError(err.to_string()),
+                        };
+                        let mut state = state_arc.write().unwrap();
+                        if let Some(run) =
+                            state.workflow_runs.iter_mut().find(|run| run.id == run_id)
+                        {
+                            run.jobs = jobs_state;
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     fn open_selected_workflow(&self) {
         let state = self.state.read().unwrap();
         if let Some(selected_index) = state.table_state.selected() {
-            if let Some(workflow_run) = state.workflow_runs.get(selected_index) {
-                let url = &workflow_run.html_url;
+            if let Some(run) = state.workflow_runs.get(selected_index) {
+                let url = &run.html_url;
                 debug!("opening URL: {}", url);
 
                 if let Err(e) = webbrowser::open(url) {
@@ -420,7 +454,7 @@ struct WorkflowRun {
     html_url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum JobsState {
     NotLoaded,
     Loading,
@@ -441,10 +475,10 @@ impl From<&WorkflowRun> for Row<'_> {
         }];
         if run.show_jobs {
             let jobs_details = match run.jobs {
-                JobsState::NotLoaded => vec![Line::from("Jobs not loaded")],
-                JobsState::Loading => vec![Line::from("Loading jobs...")],
+                JobsState::NotLoaded => vec![Line::from("  Jobs not loaded")],
+                JobsState::Loading => vec![Line::from("  Loading jobs...")],
                 JobsState::LoadingError(err) => {
-                    vec![Line::from(format!("Error loading jobs: {:?}", err))]
+                    vec![Line::from(format!("  Error loading jobs: {:?}", err))]
                 }
                 JobsState::Loaded(jobs) => {
                     let mut all_items = Vec::new();
