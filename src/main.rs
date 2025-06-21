@@ -418,7 +418,32 @@ impl Widget for &WorkflowRunsListWidget {
                 .collect::<Row>()
                 .style(Style::new().bold())
                 .height(1);
-            let rows = state.workflow_runs.iter();
+            let max_height = area.height as i32 - 3; // 1 header and 2 border
+            let offset = state.table_state.offset();
+            let mut consumed_height = 0;
+            let rows = state.workflow_runs.iter().enumerate().map(|(i, run)| {
+                let row_height: i32 = match (run.show_jobs, &run.jobs) {
+                    (false, _) => 1,
+                    (true, JobsState::Loaded(jobs)) => {
+                        jobs.iter().map(|job| job.steps.len() + 1).sum::<usize>() as i32 + 1
+                    }
+                    _ => 2,
+                };
+
+                let visible_height = if i < offset {
+                    row_height
+                } else if consumed_height < max_height && consumed_height + row_height > max_height
+                {
+                    let partial_height = max_height - consumed_height;
+                    consumed_height = max_height;
+                    partial_height
+                } else {
+                    consumed_height += row_height;
+                    row_height
+                };
+                let row: Row = run.into();
+                row.height(visible_height as u16)
+            });
             let widths = [
                 Constraint::Length(state.constraint_lens.0 + 1),
                 Constraint::Length(cmp::max(state.constraint_lens.1 + 1, 7)),
