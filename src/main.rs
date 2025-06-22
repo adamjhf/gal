@@ -278,7 +278,9 @@ impl WorkflowRunsListWidget {
                             || !matches!(run.jobs, JobsState::Loaded(_)))
                 })
                 .map(|run| {
-                    run.jobs = JobsState::Loading;
+                    if run.jobs == JobsState::NotLoaded {
+                        run.jobs = JobsState::Loading;
+                    }
                     (run.id, run.status == "completed")
                 })
                 .collect::<Vec<_>>()
@@ -357,6 +359,7 @@ impl WorkflowRunsListWidget {
                 WorkflowRun {
                     id: run.id,
                     name: run.name,
+                    commit: run.head_commit.message,
                     branch: run.head_branch.to_string(),
                     status: run.status,
                     conclusion: run.conclusion,
@@ -606,6 +609,7 @@ impl ColoredText {
 struct WorkflowRun {
     id: RunId,
     name: String,
+    commit: String,
     branch: String,
     status: String,
     conclusion: Option<String>,
@@ -631,7 +635,7 @@ impl WorkflowRun {
         let mut details_lines = vec![{
             let status_symbol = get_run_status_symbol(&run.status, &run.conclusion);
             Line::styled(
-                format!("{} {}", status_symbol.symbol, run.name),
+                format!("{} {} - {}", status_symbol.symbol, run.name, run.commit),
                 Style::default().fg(status_symbol.color),
             )
         }];
