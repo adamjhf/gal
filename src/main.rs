@@ -586,7 +586,7 @@ impl Widget for &WorkflowRunsListWidget {
                 .header(header)
                 .highlight_spacing(HighlightSpacing::Always)
                 .highlight_symbol("> ")
-                .row_highlight_style(Style::new().on_dark_gray().bold());
+                .row_highlight_style(Style::new().on_black().bold());
 
             StatefulWidget::render(table, area, buf, &mut state.table_state);
         }
@@ -597,14 +597,16 @@ impl Widget for &WorkflowRunsListWidget {
 struct ColoredText {
     prefix: String,
     text: String,
+    suffix: String,
     color: Color,
 }
 
 impl ColoredText {
-    fn new(prefix: String, text: String, color: Color) -> Self {
+    fn new(prefix: String, text: String, suffix: String, color: Color) -> Self {
         Self {
             prefix,
             text,
+            suffix,
             color,
         }
     }
@@ -657,11 +659,16 @@ impl WorkflowRun {
                     for (job_index, job) in jobs.iter().enumerate() {
                         let is_last_job = job_index == jobs.len() - 1;
                         let job_prefix = if is_last_job { "└─ " } else { "├─ " };
-
                         let job_status = get_job_status_symbol(&job.status, &job.conclusion);
+                        let duration = match (&job.status, job.completed_at) {
+                            (Status::InProgress, _) => format_duration(job.started_at, Utc::now()),
+                            (_, Some(completed)) => format_duration(job.started_at, completed),
+                            _ => String::new(),
+                        };
                         all_items.push(ColoredText::new(
                             job_prefix.into(),
                             format!("{} {}", job_status.symbol, job.name),
+                            duration,
                             job_status.color,
                         ));
 
@@ -682,9 +689,20 @@ impl WorkflowRun {
                             };
 
                             let status = get_job_status_symbol(&step.status, &step.conclusion);
+                            let duration = match (&step.status, step.started_at, step.completed_at)
+                            {
+                                (Status::InProgress, Some(started), _) => {
+                                    format_duration(started, Utc::now())
+                                }
+                                (_, Some(started), Some(completed)) => {
+                                    format_duration(started, completed)
+                                }
+                                _ => String::new(),
+                            };
                             all_items.push(ColoredText::new(
                                 step_prefix.into(),
                                 format!("{} {}", status.symbol, step.name),
+                                duration,
                                 status.color,
                             ));
                         }
@@ -696,6 +714,10 @@ impl WorkflowRun {
                             Line::from(vec![
                                 Span::styled(ct.prefix, Style::default().fg(Color::DarkGray)),
                                 Span::styled(ct.text, Style::default().fg(ct.color)),
+                                Span::styled(
+                                    format!(" {}", ct.suffix),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
                             ])
                         })
                         .collect::<Vec<_>>()
@@ -732,6 +754,18 @@ impl From<(&'static str, Color)> for StatusDisplay {
             symbol: tuple.0,
             color: tuple.1,
         }
+    }
+}
+
+fn format_duration(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
+    let total_seconds = end.signed_duration_since(start).num_seconds().abs();
+
+    if total_seconds < 60 {
+        format!("{}s", total_seconds)
+    } else {
+        let minutes = total_seconds / 60;
+        let seconds = total_seconds % 60;
+        format!("{}m {}s", minutes, seconds)
     }
 }
 
