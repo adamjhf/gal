@@ -21,7 +21,7 @@ use ratatui::DefaultTerminal;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, HighlightSpacing, Paragraph, Row, Table, TableState};
 use throbber_widgets_tui::{Throbber, ThrobberState};
-use tokio::time::interval;
+use tokio::time::{Instant, interval};
 use tokio_stream::StreamExt;
 use tracing::{debug, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -107,13 +107,14 @@ async fn main() -> Result<()> {
 struct App {
     workflow_runs: WorkflowRunsListWidget,
     should_quit: bool,
-    has_interaction: bool,
+    last_interaction: Instant,
 }
 
 impl App {
     const FRAMES_PER_SECOND: f32 = 60.0;
     const IDLE_FRAMES_PER_SECOND: f32 = 1.0;
     const THROBBER_FRAMES_PER_SECOND: f32 = 20.0;
+    const INTERACTION_TIMEOUT: Duration = Duration::from_millis(200);
 
     pub fn new(args: Args) -> Self {
         let repo = match args.repo {
@@ -132,7 +133,7 @@ impl App {
         Self {
             workflow_runs,
             should_quit: false,
-            has_interaction: false,
+            last_interaction: Instant::now(),
         }
     }
 
@@ -148,20 +149,22 @@ impl App {
         let mut events = EventStream::new();
 
         while !self.should_quit {
-            let is_idle = !self.workflow_runs.has_data_updates() && !self.has_interaction;
+            let is_idle = !self.workflow_runs.has_data_updates()
+                && self.last_interaction.elapsed() > Self::INTERACTION_TIMEOUT;
             tokio::select! {
                 _ = normal_interval.tick(), if !is_idle => {
                     terminal.draw(|frame| self.render(frame))?;
                     self.workflow_runs.set_data_updated(false);
-                    self.has_interaction = false;
                 },
                 _ = idle_interval.tick(), if is_idle => {
                     terminal.draw(|frame| self.render(frame))?;
                     self.workflow_runs.set_data_updated(false);
-                    self.has_interaction = false;
                 },
                 _ = throbber_interval.tick()=> self.workflow_runs.update_throbber(),
-                Some(Ok(event)) = events.next() => self.handle_event(&event),
+                Some(Ok(event)) = events.next() => {
+                    self.handle_event(&event);
+                    self.last_interaction = Instant::now();
+                }
             }
         }
         Ok(())
@@ -173,7 +176,6 @@ impl App {
 
     fn handle_event(&mut self, event: &Event) {
         if let Some(key) = event.as_key_press_event() {
-            let mut has_interaction = true;
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
                 KeyCode::Char('j') | KeyCode::Down => self.workflow_runs.scroll_down(),
@@ -183,11 +185,8 @@ impl App {
                     let runs = Arc::new(self.workflow_runs.clone());
                     runs.toggle_selected_workflow()
                 }
-                _ => {
-                    has_interaction = false;
-                }
+                _ => {}
             }
-            self.has_interaction = has_interaction;
         }
     }
 }
