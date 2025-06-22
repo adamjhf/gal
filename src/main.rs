@@ -107,11 +107,13 @@ async fn main() -> Result<()> {
 struct App {
     workflow_runs: WorkflowRunsListWidget,
     should_quit: bool,
+    has_interaction: bool,
 }
 
 impl App {
     const FRAMES_PER_SECOND: f32 = 60.0;
-    const THROBBER_FPS: f32 = 20.0;
+    const IDLE_FRAMES_PER_SECOND: f32 = 1.0;
+    const THROBBER_FRAMES_PER_SECOND: f32 = 20.0;
 
     pub fn new(args: Args) -> Self {
         let repo = match args.repo {
@@ -130,6 +132,7 @@ impl App {
         Self {
             workflow_runs,
             should_quit: false,
+            has_interaction: false,
         }
     }
 
@@ -137,15 +140,27 @@ impl App {
         self.workflow_runs.run();
 
         let period = Duration::from_secs_f32(1.0 / Self::FRAMES_PER_SECOND);
-        let throbber_period = Duration::from_secs_f32(1.0 / Self::THROBBER_FPS);
-        let mut interval = tokio::time::interval(period);
+        let idle_period = Duration::from_secs_f32(1.0 / Self::IDLE_FRAMES_PER_SECOND);
+        let throbber_period = Duration::from_secs_f32(1.0 / Self::THROBBER_FRAMES_PER_SECOND);
+        let mut normal_interval = tokio::time::interval(period);
+        let mut idle_interval = tokio::time::interval(idle_period);
         let mut throbber_interval = tokio::time::interval(throbber_period);
         let mut events = EventStream::new();
 
         while !self.should_quit {
+            let is_idle = !self.workflow_runs.has_data_updates() && !self.has_interaction;
             tokio::select! {
-                _ = interval.tick() => { terminal.draw(|frame| self.render(frame))?; },
-                _ = throbber_interval.tick() => self.workflow_runs.update_throbber(),
+                _ = normal_interval.tick(), if !is_idle => {
+                    terminal.draw(|frame| self.render(frame))?;
+                    self.workflow_runs.set_data_updated(false);
+                    self.has_interaction = false;
+                },
+                _ = idle_interval.tick(), if is_idle => {
+                    terminal.draw(|frame| self.render(frame))?;
+                    self.workflow_runs.set_data_updated(false);
+                    self.has_interaction = false;
+                },
+                _ = throbber_interval.tick()=> self.workflow_runs.update_throbber(),
                 Some(Ok(event)) = events.next() => self.handle_event(&event),
             }
         }
@@ -158,6 +173,7 @@ impl App {
 
     fn handle_event(&mut self, event: &Event) {
         if let Some(key) = event.as_key_press_event() {
+            let mut has_interaction = true;
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
                 KeyCode::Char('j') | KeyCode::Down => self.workflow_runs.scroll_down(),
@@ -167,8 +183,11 @@ impl App {
                     let runs = Arc::new(self.workflow_runs.clone());
                     runs.toggle_selected_workflow()
                 }
-                _ => {}
+                _ => {
+                    has_interaction = false;
+                }
             }
+            self.has_interaction = has_interaction;
         }
     }
 }
@@ -191,6 +210,7 @@ struct WorkflowRunsListState {
     table_state: TableState,
     throbber_state: ThrobberState,
     completed_workflow_jobs: HashMap<u64, Vec<Job>>,
+    data_updated: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -227,6 +247,14 @@ impl WorkflowRunsListWidget {
         }
     }
 
+    fn has_data_updates(&self) -> bool {
+        self.state.read().unwrap().data_updated
+    }
+
+    fn set_data_updated(&self, data_updated: bool) {
+        self.state.write().unwrap().data_updated = data_updated;
+    }
+
     fn new(client: Octocrab, repo: GitHubRepo, branches: Option<Vec<String>>) -> Self {
         Self {
             state: Default::default(),
@@ -260,6 +288,7 @@ impl WorkflowRunsListWidget {
         state.loading_state = LoadingState::Loaded;
         let was_empty = state.workflow_runs.is_empty();
         state.workflow_runs = runs;
+        state.data_updated = true;
         if !state.workflow_runs.is_empty() && was_empty {
             state.table_state.select(Some(0));
         }
@@ -303,6 +332,7 @@ impl WorkflowRunsListWidget {
                 run.jobs = jobs_state;
             }
         }
+        state.data_updated = true;
     }
 
     fn on_err(&self, err: &ErrReport) {
@@ -459,9 +489,11 @@ impl WorkflowRunsListWidget {
                             state.workflow_runs.iter_mut().find(|run| run.id == run_id)
                         {
                             run.jobs = jobs_state;
+                            state.data_updated = true;
                         }
                     });
                 }
+                state.data_updated = true;
             }
         }
     }
