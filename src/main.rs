@@ -355,7 +355,7 @@ impl WorkflowRunsListWidget {
                     .unwrap_or(run.status.clone())
                     .as_str()
                 {
-                    "failure" | "in_progress" => true,
+                    "failure" | "in_progress" | "queued" => true,
                     _ => false,
                 };
                 WorkflowRun {
@@ -739,13 +739,16 @@ fn get_run_status_symbol(status: &String, conclusion: &Option<String>) -> Status
     match status.as_str() {
         "in_progress" => ("⏵", Color::Yellow),
         "queued" => ("⏸", Color::Blue),
+        "pending" => ("⏸", Color::Blue),
         "completed" => match conclusion.as_ref().map(|s| s.as_str()) {
             Some("success") => ("✔", Color::Green),
             Some("failure") => ("⚠", Color::Red),
+            Some("timed_out") => ("⚠", Color::Red),
             Some("cancelled") => ("∅", Color::Gray),
             Some("skipped") => ("⏭", Color::Magenta),
             _ => ("⏺", Color::Green),
         },
+        "failed" => ("⚠", Color::Red),
         _ => ("?", Color::Magenta),
     }
     .into()
@@ -755,13 +758,16 @@ fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> St
     match status {
         Status::InProgress => ("⏵", Color::Yellow),
         Status::Queued => ("⏸", Color::Blue),
+        Status::Pending => ("⏸", Color::Blue),
         Status::Completed => match conclusion.as_ref() {
             Some(Conclusion::Success) => ("✔", Color::Green),
             Some(Conclusion::Failure) => ("⚠", Color::Red),
+            Some(Conclusion::TimedOut) => ("⚠", Color::Red),
             Some(Conclusion::Cancelled) => ("∅", Color::Gray),
             Some(Conclusion::Skipped) => ("⏭", Color::Magenta),
             _ => ("⏺", Color::Green),
         },
+        Status::Failed => ("⚠", Color::Red),
         _ => ("?", Color::Magenta),
     }
     .into()
