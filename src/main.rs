@@ -3,7 +3,7 @@ use std::env;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Utc};
 use clap::Parser;
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     let (file_appender, _guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::never("logs", "app.log"));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("gal=info,warn"))
+        .with(tracing_subscriber::EnvFilter::new("gal=warn,warn"))
         .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
         .init();
 
@@ -184,6 +184,9 @@ struct WorkflowRunsListWidget {
 #[derive(Debug, Default)]
 struct WorkflowRunsListState {
     workflow_runs: Vec<WorkflowRun>,
+    cached_run_rows: Vec<RunRow<'static>>,
+    cached_column_widths: Vec<Constraint>,
+    last_cache_update: Option<Instant>,
     loading_state: LoadingState,
     table_state: TableState,
     throbber_state: ThrobberState,
@@ -200,6 +203,30 @@ enum LoadingState {
 }
 
 impl WorkflowRunsListWidget {
+    const CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+    fn should_refresh_cache(&self) -> bool {
+        let state = self.state.read().unwrap();
+        match state.last_cache_update {
+            None => true,
+            Some(last_update) => last_update.elapsed() >= Self::CACHE_REFRESH_INTERVAL,
+        }
+    }
+
+    fn refresh_cache_if_needed(&self) {
+        if self.should_refresh_cache() {
+            let mut state = self.state.write().unwrap();
+
+            state.cached_run_rows = state.workflow_runs.iter().map(|run| run.to_row()).collect();
+
+            let headers = ["ID", "Time", "Branch", "Run"];
+            state.cached_column_widths =
+                self.calculate_column_widths(&headers, &state.cached_run_rows);
+
+            state.last_cache_update = Some(Instant::now());
+        }
+    }
+
     fn new(client: Octocrab, repo: GitHubRepo, branches: Option<Vec<String>>) -> Self {
         Self {
             state: Default::default(),
@@ -450,7 +477,7 @@ impl WorkflowRunsListWidget {
         }
     }
 
-    fn calculate_column_widths(&self, headers: &[&str], rows: &Vec<RunRow>) -> Vec<Constraint> {
+    fn calculate_column_widths(&self, headers: &[&str], rows: &[RunRow]) -> Vec<Constraint> {
         let mut max_widths = headers
             .iter()
             .take(3)
@@ -473,6 +500,7 @@ impl WorkflowRunsListWidget {
 
 impl Widget for &WorkflowRunsListWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        self.refresh_cache_if_needed();
         let mut state = self.state.write().unwrap();
 
         let mut block = Block::bordered()
@@ -492,7 +520,7 @@ impl Widget for &WorkflowRunsListWidget {
             _ => block,
         };
 
-        if state.workflow_runs.is_empty() {
+        if state.cached_run_rows.is_empty() {
             let loading_message = match &state.loading_state {
                 LoadingState::Loading => "Loading workflow runs from GitHub...",
                 LoadingState::Error(err) => err.as_str(),
@@ -517,14 +545,10 @@ impl Widget for &WorkflowRunsListWidget {
             let max_height = area.height as i32 - 3; // 1 header and 2 border
             let offset = state.table_state.offset();
             let mut consumed_height = 0;
-            let run_rows = state
-                .workflow_runs
+            let widths = &state.cached_column_widths;
+            let rows = state
+                .cached_run_rows
                 .iter()
-                .map(|run| run.to_row())
-                .collect::<Vec<_>>();
-            let widths = self.calculate_column_widths(&headers, &run_rows);
-            let rows = run_rows
-                .into_iter()
                 .enumerate()
                 .map(|(i, run)| {
                     let row_height = run.details_lines.len() as i32;
@@ -541,10 +565,10 @@ impl Widget for &WorkflowRunsListWidget {
                         row_height
                     };
                     let row: Row = Row::new(vec![
-                        Cell::from(run.id),
-                        Cell::from(run.time),
-                        Cell::from(run.branch),
-                        Cell::from(run.details_lines),
+                        Cell::from(run.id.clone()),
+                        Cell::from(run.time.clone()),
+                        Cell::from(run.branch.clone()),
+                        Cell::from(run.details_lines.clone()),
                     ]);
                     row.height(visible_height as u16)
                 })
@@ -680,6 +704,7 @@ impl WorkflowRun {
     }
 }
 
+#[derive(Debug)]
 struct RunRow<'a> {
     id: String,
     time: String,
