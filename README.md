@@ -6,12 +6,10 @@ A terminal-based GitHub Actions workflow monitor that provides near-real-time up
 
 ## Installation
 
-### From source
+### Cargo
 
 ```bash
-git clone https://github.com/adamjhf/gal
-cd gal
-cargo install --path .
+cargo install gal-cli
 ```
 
 ## Usage
