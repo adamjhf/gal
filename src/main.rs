@@ -93,11 +93,13 @@ impl App {
             None => parse_github_repo(&get_git_origin_url().unwrap()).unwrap(),
         };
 
-        let token = env::var("GITHUB_TOKEN").unwrap();
-        let octocrab = octocrab::Octocrab::builder()
-            .personal_token(token.to_owned())
-            .build()
-            .unwrap();
+        let octocrab = match env::var("GITHUB_TOKEN") {
+            Ok(token) => octocrab::Octocrab::builder()
+                .personal_token(token.to_owned())
+                .build()
+                .unwrap(),
+            Err(_) => octocrab::Octocrab::default(),
+        };
 
         let workflow_runs = WorkflowRunsListWidget::new(octocrab, repo, args.branch);
 
@@ -279,7 +281,7 @@ impl WorkflowRunsListWidget {
     }
 
     fn on_err(&self, err: &ErrReport) {
-        self.set_loading_state(LoadingState::Error(err.to_string()));
+        self.set_loading_state(LoadingState::Error(format!("{err:?}")));
     }
 
     fn set_loading_state(&self, state: LoadingState) {
@@ -466,7 +468,9 @@ impl WorkflowRunsListWidget {
         for row in rows {
             max_widths[0] = max_widths[0].max(UnicodeWidthStr::width(row.id.as_str()));
             max_widths[1] = max_widths[1].max(UnicodeWidthStr::width(row.time.as_str()));
-            max_widths[2] = max_widths[2].max(UnicodeWidthStr::width(row.branch.as_str()));
+            max_widths[2] = max_widths[2]
+                .max(UnicodeWidthStr::width(row.branch.as_str()))
+                .min(25);
         }
 
         max_widths
@@ -502,9 +506,7 @@ impl Widget for &WorkflowRunsListWidget {
                 let throbber_text = throbber_span.content.as_ref().trim_end().to_string();
                 block.title(Line::from(throbber_text).right_aligned())
             }
-            LoadingState::Error(err) => {
-                block.title(Line::from(format!("Error: {err:?}")).right_aligned())
-            }
+            LoadingState::Error(_) => block.title(Line::from(format!("Error")).right_aligned()),
             _ => block,
         };
 
@@ -518,7 +520,6 @@ impl Widget for &WorkflowRunsListWidget {
 
             let paragraph = Paragraph::new(Text::from(loading_message))
                 .block(block)
-                .alignment(Alignment::Center)
                 .wrap(ratatui::widgets::Wrap { trim: true });
 
             paragraph.render(area, buf);
