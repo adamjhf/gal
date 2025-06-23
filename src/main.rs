@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -32,70 +33,40 @@ use unicode_width::UnicodeWidthStr;
 #[command(about = "Monitor GitHub Action workflow runs in the terminal")]
 struct Args {
     /// GitHub repository in owner/repo format (defaults to origin of current git repo)
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "OWNER/REPO")]
     repo: Option<GitHubRepo>,
 
     /// Filter to specific branches (defaults to all branches)
     #[arg(short, long, value_delimiter = ',')]
     branch: Option<Vec<String>>,
-}
 
-#[derive(Clone, Debug)]
-struct GitHubRepo {
-    owner: String,
-    name: String,
-}
-
-impl GitHubRepo {
-    pub fn new(owner: String, name: String) -> Self {
-        Self { owner, name }
-    }
-
-    pub fn full_name(&self) -> String {
-        format!("{}/{}", self.owner, self.name)
-    }
-}
-
-impl FromStr for GitHubRepo {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split('/').collect();
-
-        if parts.len() != 2 {
-            return Err("Repository must be in 'owner/repo' format".to_string());
-        }
-
-        let owner = parts[0].trim();
-        let name = parts[1].trim();
-
-        if owner.is_empty() {
-            return Err("Owner name cannot be empty".to_string());
-        }
-        if name.is_empty() {
-            return Err("Repository name cannot be empty".to_string());
-        }
-
-        Ok(GitHubRepo::new(owner.to_string(), name.to_string()))
-    }
-}
-
-impl std::fmt::Display for GitHubRepo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.owner, self.name)
-    }
+    /// Output logs to a file
+    #[arg(short, long, value_name = "FILE")]
+    log: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (file_appender, _guard) =
-        tracing_appender::non_blocking(tracing_appender::rolling::never("logs", "app.log"));
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("gal=debug,warn"))
-        .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
-        .init();
 
+    let _guard = match &args.log {
+        Some(log_path) => {
+            let log_dir = log_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let log_file = log_path.file_name().unwrap().to_str().unwrap();
+            let (file_appender, guard) =
+                tracing_appender::non_blocking(tracing_appender::rolling::never(log_dir, log_file));
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new("gal=debug,warn"))
+                .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
+                .init();
+            Some(guard)
+        }
+        _ => None,
+    };
+
+    debug!("initialising app");
     color_eyre::install()?;
     let terminal = ratatui::init();
     let app_result = App::new(args).run(terminal).await;
@@ -916,6 +887,52 @@ fn format_relative_time(dt: DateTime<Utc>) -> String {
                 (years, _) => format!("{years}y ago"),
             }
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GitHubRepo {
+    owner: String,
+    name: String,
+}
+
+impl GitHubRepo {
+    pub fn new(owner: String, name: String) -> Self {
+        Self { owner, name }
+    }
+
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+}
+
+impl FromStr for GitHubRepo {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('/').collect();
+
+        if parts.len() != 2 {
+            return Err("Repository must be in 'owner/repo' format".to_string());
+        }
+
+        let owner = parts[0].trim();
+        let name = parts[1].trim();
+
+        if owner.is_empty() {
+            return Err("Owner name cannot be empty".to_string());
+        }
+        if name.is_empty() {
+            return Err("Repository name cannot be empty".to_string());
+        }
+
+        Ok(GitHubRepo::new(owner.to_string(), name.to_string()))
+    }
+}
+
+impl std::fmt::Display for GitHubRepo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.owner, self.name)
     }
 }
 
