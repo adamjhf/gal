@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     let (file_appender, _guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::never("logs", "app.log"));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("gal=warn,warn"))
+        .with(tracing_subscriber::EnvFilter::new("gal=debug,warn"))
         .with(tracing_subscriber::fmt::layer().with_writer(file_appender))
         .init();
 
@@ -343,13 +343,13 @@ impl WorkflowRunsListWidget {
             state
                 .workflow_runs
                 .iter()
-                .map(|run| (run.id, run.show_jobs))
-                .collect::<HashMap<RunId, bool>>()
+                .map(|run| (run.id, (run.show_jobs, run.jobs.clone())))
+                .collect::<HashMap<RunId, (bool, JobsState)>>()
         });
         let details_futures = workflows.into_iter().map(|run| {
             let existing_workflow_runs = existing_workflow_runs.clone();
             async move {
-                let show_jobs = match run
+                let show_jobs_default = match run
                     .conclusion
                     .clone()
                     .unwrap_or(run.status.clone())
@@ -358,6 +358,10 @@ impl WorkflowRunsListWidget {
                     "failure" | "in_progress" | "queued" => true,
                     _ => false,
                 };
+                let show_jobs = match existing_workflow_runs.get(&run.id) {
+                    Some((show_jobs, _)) => *show_jobs,
+                    None => show_jobs_default,
+                };
                 WorkflowRun {
                     id: run.id,
                     name: run.name,
@@ -365,11 +369,12 @@ impl WorkflowRunsListWidget {
                     branch: run.head_branch.to_string(),
                     status: run.status,
                     conclusion: run.conclusion,
-                    show_jobs: match existing_workflow_runs.get(&run.id) {
-                        Some(existing) => *existing,
-                        None => show_jobs,
+                    show_jobs,
+                    jobs: match existing_workflow_runs.get(&run.id) {
+                        Some((true, JobsState::Loaded(jobs))) => JobsState::Reloading(jobs.clone()),
+                        Some((_, jobs)) => jobs.clone(),
+                        None => JobsState::NotLoaded,
                     },
-                    jobs: JobsState::NotLoaded,
                     created_at: run.created_at,
                     html_url: run.html_url.clone().into(),
                 }
@@ -632,6 +637,7 @@ enum JobsState {
     NotLoaded,
     Loading,
     Loaded(Vec<Job>),
+    Reloading(Vec<Job>),
     LoadingError(String),
 }
 
@@ -653,7 +659,7 @@ impl WorkflowRun {
                 JobsState::LoadingError(err) => {
                     vec![Line::from(format!("  Error loading jobs: {:?}", err))]
                 }
-                JobsState::Loaded(jobs) => {
+                JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => {
                     let mut all_items = Vec::new();
 
                     for (job_index, job) in jobs.iter().enumerate() {
