@@ -485,9 +485,19 @@ impl Widget for &WorkflowRunsListWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let mut state = self.state.write().unwrap();
 
+        let white = Style::default().fg(Color::White);
         let mut block = Block::bordered()
             .title(self.repo.full_name())
-            .title_bottom("j/k to scroll, enter to open in browser, q to quit");
+            .title_bottom(Line::from(vec![
+                Span::styled("j/k", white),
+                Span::from(" up/down  "),
+                Span::styled("space", white),
+                Span::from(" show jobs/steps  "),
+                Span::styled("enter", white),
+                Span::from(" open browser  "),
+                Span::styled("q", white),
+                Span::from(" quit"),
+            ]));
 
         block = match &state.loading_state {
             LoadingState::Loading => {
