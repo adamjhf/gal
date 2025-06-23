@@ -320,15 +320,13 @@ impl WorkflowRunsListWidget {
         let details_futures = workflows.into_iter().map(|run| {
             let existing_workflow_runs = existing_workflow_runs.clone();
             async move {
-                let show_jobs_default = match run
-                    .conclusion
-                    .clone()
-                    .unwrap_or(run.status.clone())
-                    .as_str()
-                {
-                    "failure" | "in_progress" | "queued" => true,
-                    _ => false,
-                };
+                let show_jobs_default = matches!(
+                    run.conclusion
+                        .clone()
+                        .unwrap_or(run.status.clone())
+                        .as_str(),
+                    "failure" | "in_progress" | "queued"
+                );
                 let show_jobs = match existing_workflow_runs.get(&run.id) {
                     Some((show_jobs, _)) => *show_jobs,
                     None => show_jobs_default,
@@ -416,46 +414,44 @@ impl WorkflowRunsListWidget {
 
     fn toggle_selected_workflow(self: Arc<Self>) {
         let mut state = self.state.write().unwrap();
-        if let Some(selected_index) = state.table_state.selected() {
-            if let Some(run) = state.workflow_runs.get_mut(selected_index) {
-                let this = self.clone();
-                let run_id = run.id;
-                let is_completed = run.status.as_str() == "completed";
-                run.show_jobs = !run.show_jobs;
-                if run.show_jobs {
-                    if run.jobs == JobsState::NotLoaded {
-                        run.jobs = JobsState::Loading;
-                    }
-                    let state_arc = self.state.clone();
-                    tokio::spawn(async move {
-                        let jobs_state = match this.get_workflow_jobs(run_id, is_completed).await {
-                            Ok(jobs) => JobsState::Loaded(jobs),
-                            Err(err) => JobsState::LoadingError(err.to_string()),
-                        };
-                        let mut state = state_arc.write().unwrap();
-                        if let Some(run) =
-                            state.workflow_runs.iter_mut().find(|run| run.id == run_id)
-                        {
-                            run.jobs = jobs_state;
-                            state.data_updated = true;
-                        }
-                    });
+        if let Some(selected_index) = state.table_state.selected()
+            && let Some(run) = state.workflow_runs.get_mut(selected_index)
+        {
+            let this = self.clone();
+            let run_id = run.id;
+            let is_completed = run.status.as_str() == "completed";
+            run.show_jobs = !run.show_jobs;
+            if run.show_jobs {
+                if run.jobs == JobsState::NotLoaded {
+                    run.jobs = JobsState::Loading;
                 }
-                state.data_updated = true;
+                let state_arc = self.state.clone();
+                tokio::spawn(async move {
+                    let jobs_state = match this.get_workflow_jobs(run_id, is_completed).await {
+                        Ok(jobs) => JobsState::Loaded(jobs),
+                        Err(err) => JobsState::LoadingError(err.to_string()),
+                    };
+                    let mut state = state_arc.write().unwrap();
+                    if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == run_id) {
+                        run.jobs = jobs_state;
+                        state.data_updated = true;
+                    }
+                });
             }
+            state.data_updated = true;
         }
     }
 
     fn open_selected_workflow(&self) {
         let state = self.state.read().unwrap();
-        if let Some(selected_index) = state.table_state.selected() {
-            if let Some(run) = state.workflow_runs.get(selected_index) {
-                let url = &run.html_url;
-                debug!("opening URL: {}", url);
+        if let Some(selected_index) = state.table_state.selected()
+            && let Some(run) = state.workflow_runs.get(selected_index)
+        {
+            let url = &run.html_url;
+            debug!("opening URL: {}", url);
 
-                if let Err(e) = webbrowser::open(url) {
-                    error!("Failed to open browser: {}", e);
-                }
+            if let Err(e) = webbrowser::open(url) {
+                error!("Failed to open browser: {}", e);
             }
         }
     }
@@ -507,7 +503,7 @@ impl Widget for &WorkflowRunsListWidget {
                 block.title(Line::from(throbber_text).right_aligned())
             }
             LoadingState::Error(err) => {
-                block.title(Line::from(format!("Error: {:?}", err)).right_aligned())
+                block.title(Line::from(format!("Error: {err:?}")).right_aligned())
             }
             _ => block,
         };
@@ -623,7 +619,7 @@ enum JobsState {
 }
 
 impl WorkflowRun {
-    fn to_row<'a, 'b>(&'a self) -> RunRow<'b> {
+    fn to_row<'a>(&self) -> RunRow<'a> {
         let run = self;
 
         let mut details_lines = vec![{
@@ -638,7 +634,7 @@ impl WorkflowRun {
                 JobsState::NotLoaded => vec![Line::from("  Jobs not loaded")],
                 JobsState::Loading => vec![Line::from("  Loading jobs...")],
                 JobsState::LoadingError(err) => {
-                    vec![Line::from(format!("  Error loading jobs: {:?}", err))]
+                    vec![Line::from(format!("  Error loading jobs: {err:?}"))]
                 }
                 JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => {
                     let mut all_items = Vec::new();
@@ -667,12 +663,10 @@ impl WorkflowRun {
                                 } else {
                                     "   ├─ "
                                 }
+                            } else if is_last_step {
+                                "│  └─ "
                             } else {
-                                if is_last_step {
-                                    "│  └─ "
-                                } else {
-                                    "│  ├─ "
-                                }
+                                "│  ├─ "
                             };
 
                             let status = get_job_status_symbol(&step.status, &step.conclusion);
@@ -748,16 +742,16 @@ fn format_duration(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
     let total_seconds = end.signed_duration_since(start).num_seconds().abs();
 
     if total_seconds < 60 {
-        format!("{}s", total_seconds)
+        format!("{total_seconds}s")
     } else {
         let minutes = total_seconds / 60;
         let seconds = total_seconds % 60;
-        format!("{}m {}s", minutes, seconds)
+        format!("{minutes}m {seconds}s")
     }
 }
 
-fn get_run_status_symbol(status: &String, conclusion: &Option<String>) -> StatusDisplay {
-    match status.as_str() {
+fn get_run_status_symbol(status: &str, conclusion: &Option<String>) -> StatusDisplay {
+    match status {
         "in_progress" => ("⏵", Color::Yellow),
         "queued" => ("⏸", Color::Blue),
         "pending" => ("⏸", Color::Blue),
@@ -862,14 +856,14 @@ fn format_relative_time(dt: DateTime<Utc>) -> String {
     let days = diff.num_days();
 
     match seconds {
-        0..=59 => format!("{}s ago", seconds),
+        0..=59 => format!("{seconds}s ago"),
         60..=3599 => format!("{}m ago", diff.num_minutes()),
         3600..=86399 => format!("{}h ago", diff.num_hours()),
         86400..=604799 => {
             // 1-6 days
             match days {
                 1 => "yesterday".to_string(),
-                _ => format!("{}d ago", days),
+                _ => format!("{days}d ago"),
             }
         }
         604800..=3023999 => {
@@ -877,7 +871,7 @@ fn format_relative_time(dt: DateTime<Utc>) -> String {
             let weeks = days / 7;
             match weeks {
                 1 => "last week".to_string(),
-                _ => format!("{}w ago", weeks),
+                _ => format!("{weeks}w ago"),
             }
         }
         _ => {
