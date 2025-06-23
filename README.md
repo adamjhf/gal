@@ -30,7 +30,7 @@ gal --repo owner/repo --log /path/to/logfile.log
 
 ## Environment Variables
 
-- `GITHUB_TOKEN` - Required GitHub personal access token
+- `GITHUB_TOKEN` - GitHub personal access token (required for private repos and increased rate limits)
 
 ## Command Line Options
 
