@@ -506,7 +506,7 @@ impl Widget for &WorkflowRunsListWidget {
                 let throbber_text = throbber_span.content.as_ref().trim_end().to_string();
                 block.title(Line::from(throbber_text).right_aligned())
             }
-            LoadingState::Error(_) => block.title(Line::from(format!("Error")).right_aligned()),
+            LoadingState::Error(_) => block.title(Line::from("Error").right_aligned()),
             _ => block,
         };
 
