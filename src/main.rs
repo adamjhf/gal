@@ -156,6 +156,10 @@ impl App {
                 KeyCode::Char('j') | KeyCode::Down => self.workflow_runs.scroll_down(),
                 KeyCode::Char('k') | KeyCode::Up => self.workflow_runs.scroll_up(),
                 KeyCode::Enter => self.workflow_runs.open_selected_workflow(),
+                KeyCode::Char('r') => {
+                    let runs = Arc::new(self.workflow_runs.clone());
+                    runs.rerun_selected_workflow()
+                }
                 KeyCode::Char(' ') => {
                     let runs = Arc::new(self.workflow_runs.clone());
                     runs.toggle_job_breakdown_pane()
@@ -414,6 +418,37 @@ impl WorkflowRunsListWidget {
         Ok(runs)
     }
 
+    fn rerun_selected_workflow(self: Arc<Self>) {
+        let run_id = {
+            let state = self.state.read().unwrap();
+            let Some(selected_index) = state.table_state.selected() else {
+                return;
+            };
+            let Some(run) = state.workflow_runs.get(selected_index) else {
+                return;
+            };
+            run.id
+        };
+        tokio::spawn(async move {
+            if let Err(err) = self.rerun_workflow_run(run_id).await {
+                error!("failed to rerun workflow {}: {}", run_id.0, err);
+            }
+        });
+    }
+
+    async fn rerun_workflow_run(&self, run_id: RunId) -> Result<()> {
+        let route = format!(
+            "/repos/{owner}/{repo}/actions/runs/{run_id}/rerun",
+            owner = self.repo.owner,
+            repo = self.repo.name,
+            run_id = run_id.0,
+        );
+        let _: () = self.client.post(route, None::<&()>).await?;
+        self.set_loading_state(LoadingState::Loading);
+        self.set_data_updated(true);
+        Ok(())
+    }
+
     fn toggle_job_breakdown_pane(self: Arc<Self>) {
         let mut state = self.state.write().unwrap();
         state.show_job_breakdown_pane = !state.show_job_breakdown_pane;
@@ -597,6 +632,8 @@ impl Widget for &WorkflowRunsListWidget {
                     Span::from(" up/down  "),
                     Span::styled("space", white),
                     Span::from(" toggle job pane  "),
+                    Span::styled("r", white),
+                    Span::from(" rerun run  "),
                     Span::styled("enter", white),
                     Span::from(" open browser  "),
                     Span::styled("q", white),
