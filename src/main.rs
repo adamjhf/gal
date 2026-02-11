@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -27,6 +28,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use unicode_width::UnicodeWidthStr;
+use zip::ZipArchive;
 
 #[derive(Parser)]
 #[command(version)]
@@ -192,7 +194,31 @@ enum LoadingState {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailedStepRef {
+    job_id: u64,
+    job_name: String,
+    step_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailedStepLogTail {
+    failed_step: FailedStepRef,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FailedStepLogState {
+    NotAvailable,
+    NotLoaded,
+    Loading(FailedStepRef),
+    Loaded(FailedStepLogTail),
+    LoadingError(FailedStepRef, String),
+}
+
 impl WorkflowRunsListWidget {
+    const FAILED_LOG_TAIL_LINES: usize = 100;
+
     fn has_data_updates(&self) -> bool {
         self.state.read().unwrap().data_updated
     }
@@ -240,7 +266,8 @@ impl WorkflowRunsListWidget {
             state.table_state.select(Some(0));
         }
         drop(state);
-        self.ensure_selected_workflow_jobs();
+        self.clone().ensure_selected_workflow_jobs();
+        self.ensure_selected_failed_step_log();
     }
 
     fn on_err(&self, err: &ErrReport) {
@@ -265,7 +292,9 @@ impl WorkflowRunsListWidget {
             state.show_job_breakdown_pane
         };
         if should_load {
-            Arc::new(self.clone()).ensure_selected_workflow_jobs();
+            let this = Arc::new(self.clone());
+            this.clone().ensure_selected_workflow_jobs();
+            this.ensure_selected_failed_step_log();
         }
     }
 
@@ -276,7 +305,9 @@ impl WorkflowRunsListWidget {
             state.show_job_breakdown_pane
         };
         if should_load {
-            Arc::new(self.clone()).ensure_selected_workflow_jobs();
+            let this = Arc::new(self.clone());
+            this.clone().ensure_selected_workflow_jobs();
+            this.ensure_selected_failed_step_log();
         }
     }
 
@@ -293,8 +324,8 @@ impl WorkflowRunsListWidget {
             state
                 .workflow_runs
                 .iter()
-                .map(|run| (run.id, run.jobs.clone()))
-                .collect::<HashMap<RunId, JobsState>>()
+                .map(|run| (run.id, (run.jobs.clone(), run.failed_step_log.clone())))
+                .collect::<HashMap<RunId, (JobsState, FailedStepLogState)>>()
         });
         let details_futures = workflows.into_iter().map(|run| {
             let existing_workflow_runs = existing_workflow_runs.clone();
@@ -307,8 +338,12 @@ impl WorkflowRunsListWidget {
                     status: run.status,
                     conclusion: run.conclusion,
                     jobs: match existing_workflow_runs.get(&run.id) {
-                        Some(jobs) => jobs.clone(),
+                        Some((jobs, _)) => jobs.clone(),
                         None => JobsState::NotLoaded,
+                    },
+                    failed_step_log: match existing_workflow_runs.get(&run.id) {
+                        Some((_, failed_step_log)) => failed_step_log.clone(),
+                        None => FailedStepLogState::NotLoaded,
                     },
                     created_at: run.created_at,
                     html_url: run.html_url.clone().into(),
@@ -385,7 +420,8 @@ impl WorkflowRunsListWidget {
         let should_load = state.show_job_breakdown_pane;
         drop(state);
         if should_load {
-            self.ensure_selected_workflow_jobs();
+            self.clone().ensure_selected_workflow_jobs();
+            self.ensure_selected_failed_step_log();
         }
     }
 
@@ -426,12 +462,89 @@ impl WorkflowRunsListWidget {
                 Ok(jobs) => JobsState::Loaded(jobs),
                 Err(err) => JobsState::LoadingError(err.to_string()),
             };
+            let mut refresh_failed_step_logs = false;
             let mut state = state_arc.write().unwrap();
             if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == run_id) {
                 run.jobs = jobs_state;
                 state.data_updated = true;
+                refresh_failed_step_logs = true;
+            }
+            drop(state);
+            if refresh_failed_step_logs {
+                this.ensure_selected_failed_step_log();
             }
         });
+    }
+
+    fn ensure_selected_failed_step_log(self: Arc<Self>) {
+        let selected = {
+            let mut state = self.state.write().unwrap();
+            let Some(selected_index) = state.table_state.selected() else {
+                return;
+            };
+            let Some(run) = state.workflow_runs.get(selected_index) else {
+                return;
+            };
+            let run_id = run.id;
+            let failed_step = run.first_failed_step();
+            let current_failed_step_log = run.failed_step_log.clone();
+            let Some(failed_step) = failed_step else {
+                if current_failed_step_log != FailedStepLogState::NotAvailable {
+                    if let Some(run) = state.workflow_runs.get_mut(selected_index) {
+                        run.failed_step_log = FailedStepLogState::NotAvailable;
+                    }
+                    state.data_updated = true;
+                }
+                return;
+            };
+            let should_fetch = match &current_failed_step_log {
+                FailedStepLogState::Loading(current) => current != &failed_step,
+                FailedStepLogState::Loaded(current) => current.failed_step != failed_step,
+                FailedStepLogState::LoadingError(current, _) => current != &failed_step,
+                FailedStepLogState::NotLoaded | FailedStepLogState::NotAvailable => true,
+            };
+            if !should_fetch {
+                return;
+            }
+            if let Some(run) = state.workflow_runs.get_mut(selected_index) {
+                run.failed_step_log = FailedStepLogState::Loading(failed_step.clone());
+            }
+            state.data_updated = true;
+            (run_id, failed_step)
+        };
+
+        let this = self.clone();
+        let state_arc = self.state.clone();
+        tokio::spawn(async move {
+            let (run_id, failed_step) = selected;
+            let log_state = match this.get_failed_step_log_tail(run_id, &failed_step).await {
+                Ok(lines) => FailedStepLogState::Loaded(FailedStepLogTail { failed_step, lines }),
+                Err(err) => FailedStepLogState::LoadingError(failed_step, err.to_string()),
+            };
+            let mut state = state_arc.write().unwrap();
+            if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == run_id) {
+                run.failed_step_log = log_state;
+                state.data_updated = true;
+            }
+        });
+    }
+
+    async fn get_failed_step_log_tail(
+        &self,
+        run_id: RunId,
+        failed_step: &FailedStepRef,
+    ) -> Result<Vec<String>> {
+        let logs_zip = self
+            .client
+            .actions()
+            .download_workflow_run_logs(&self.repo.owner, &self.repo.name, run_id)
+            .await?;
+        let job_log = extract_job_log_text_from_archive(logs_zip.as_ref(), failed_step)?;
+        Ok(extract_step_log_tail(
+            &job_log,
+            &failed_step.step_name,
+            Self::FAILED_LOG_TAIL_LINES,
+        ))
     }
 
     fn open_selected_workflow(&self) {
@@ -578,18 +691,53 @@ impl Widget for &WorkflowRunsListWidget {
         }
 
         if let Some(jobs_area) = jobs_area {
-            let jobs_lines = state
+            let selected_run = state
                 .table_state
                 .selected()
-                .and_then(|selected_index| state.workflow_runs.get(selected_index))
-                .map_or_else(
-                    || vec![Line::from("No workflow selected")],
-                    WorkflowRun::job_breakdown_lines,
-                );
+                .and_then(|selected_index| state.workflow_runs.get(selected_index));
+            let jobs_lines = selected_run.map_or_else(
+                || vec![Line::from("No workflow selected")],
+                WorkflowRun::job_breakdown_lines,
+            );
+            let show_failed_logs = selected_run
+                .map(WorkflowRun::has_failed_step)
+                .unwrap_or(false);
+            let (job_breakdown_area, failed_log_area) = if show_failed_logs {
+                let needed_job_height = (jobs_lines.len() as u16).saturating_add(2);
+                if needed_job_height >= jobs_area.height {
+                    (jobs_area, None)
+                } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(needed_job_height), Constraint::Min(0)])
+                        .split(jobs_area);
+                    (chunks[0], Some(chunks[1]))
+                }
+            } else {
+                (jobs_area, None)
+            };
+
             let jobs_paragraph = Paragraph::new(Text::from(jobs_lines))
-                .block(Block::bordered().title("Job Breakdown"))
-                .wrap(ratatui::widgets::Wrap { trim: true });
-            jobs_paragraph.render(jobs_area, buf);
+                .block(Block::bordered().title("Job Breakdown"));
+            jobs_paragraph.render(job_breakdown_area, buf);
+
+            if let Some(failed_log_area) = failed_log_area {
+                let failed_log_lines = selected_run.map_or_else(
+                    || vec![Line::from("No failed step selected")],
+                    WorkflowRun::failed_step_log_lines,
+                );
+                let visible_lines = failed_log_area.height.saturating_sub(2) as usize;
+                let failed_log_lines =
+                    if visible_lines == 0 || failed_log_lines.len() <= visible_lines {
+                        failed_log_lines
+                    } else {
+                        failed_log_lines[failed_log_lines.len() - visible_lines..].to_vec()
+                    };
+                let failed_log_paragraph = Paragraph::new(Text::from(failed_log_lines))
+                    .block(Block::bordered().title("Failed Step Log Tail"))
+                    .wrap(ratatui::widgets::Wrap { trim: false });
+                failed_log_paragraph.render(failed_log_area, buf);
+            }
         }
     }
 }
@@ -603,6 +751,7 @@ struct WorkflowRun {
     status: String,
     conclusion: Option<String>,
     jobs: JobsState,
+    failed_step_log: FailedStepLogState,
     #[allow(dead_code)]
     created_at: DateTime<Utc>,
     html_url: String,
@@ -703,6 +852,71 @@ impl WorkflowRun {
         }
     }
 
+    fn has_failed_step(&self) -> bool {
+        self.first_failed_step().is_some()
+    }
+
+    fn first_failed_step(&self) -> Option<FailedStepRef> {
+        match &self.jobs {
+            JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => jobs.iter().find_map(|job| {
+                job.steps.iter().find_map(|step| {
+                    let failed = matches!(
+                        step.conclusion.as_ref(),
+                        Some(
+                            Conclusion::Failure | Conclusion::TimedOut | Conclusion::ActionRequired
+                        )
+                    );
+                    if failed {
+                        Some(FailedStepRef {
+                            job_id: job.id.0,
+                            job_name: job.name.clone(),
+                            step_name: step.name.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+            }),
+            _ => None,
+        }
+    }
+
+    fn failed_step_log_lines(&self) -> Vec<Line<'static>> {
+        match &self.failed_step_log {
+            FailedStepLogState::NotAvailable => vec![Line::from("No failed step in selected run")],
+            FailedStepLogState::NotLoaded => vec![Line::from("Log tail not loaded")],
+            FailedStepLogState::Loading(failed_step) => vec![
+                Line::styled(
+                    format!("{} / {}", failed_step.job_name, failed_step.step_name),
+                    Style::default().fg(Color::White).bold(),
+                ),
+                Line::from("Loading failed-step logs..."),
+            ],
+            FailedStepLogState::LoadingError(failed_step, err) => vec![
+                Line::styled(
+                    format!("{} / {}", failed_step.job_name, failed_step.step_name),
+                    Style::default().fg(Color::White).bold(),
+                ),
+                Line::from(format!("Error loading logs: {err}")),
+            ],
+            FailedStepLogState::Loaded(tail) => {
+                let mut lines = vec![Line::styled(
+                    format!(
+                        "{} / {}",
+                        tail.failed_step.job_name, tail.failed_step.step_name
+                    ),
+                    Style::default().fg(Color::White).bold(),
+                )];
+                if tail.lines.is_empty() {
+                    lines.push(Line::from("No log lines found for failed step"));
+                    return lines;
+                }
+                lines.extend(tail.lines.iter().cloned().map(Line::from));
+                lines
+            }
+        }
+    }
+
     fn job_line(prefix: String, text: String, suffix: String, color: Color) -> Line<'static> {
         Line::from(vec![
             Span::styled(prefix, Style::default().fg(Color::DarkGray)),
@@ -781,6 +995,105 @@ fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> St
         _ => ("?", Color::Magenta),
     }
     .into()
+}
+
+fn extract_job_log_text_from_archive(
+    archive_bytes: &[u8],
+    failed_step: &FailedStepRef,
+) -> Result<String> {
+    let mut archive = ZipArchive::new(Cursor::new(archive_bytes))?;
+    let mut best_match: Option<(i32, String)> = None;
+    let job_name = normalize_log_match_key(&failed_step.job_name);
+    let step_name = normalize_log_match_key(&failed_step.step_name);
+    let job_id = failed_step.job_id.to_string();
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let name = file.name().to_string();
+        if !name.ends_with(".txt") {
+            continue;
+        }
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)?;
+        let content = String::from_utf8_lossy(&raw).into_owned();
+        let mut score = 0;
+        let normalized_name = normalize_log_match_key(&name);
+        let normalized_content = normalize_log_match_key(&content);
+        if normalized_name.contains(&job_name) {
+            score += 8;
+        }
+        if normalized_name.contains(&job_id) {
+            score += 4;
+        }
+        if normalized_content.contains(&step_name) {
+            score += 4;
+        }
+        if normalized_content.contains(&job_name) {
+            score += 2;
+        }
+        let score = score + (content.len() as i32 / 20000);
+        match &best_match {
+            Some((best_score, _)) if *best_score >= score => {}
+            _ => best_match = Some((score, content)),
+        }
+    }
+
+    best_match
+        .map(|(_, content)| content)
+        .ok_or_else(|| eyre!("No matching job log found in workflow log archive"))
+}
+
+fn extract_step_log_tail(job_log: &str, step_name: &str, max_lines: usize) -> Vec<String> {
+    let lines: Vec<&str> = job_log.lines().collect();
+    if lines.is_empty() {
+        return vec![];
+    }
+    let step_marker = format!("run {step_name}");
+    let marker_key = normalize_log_match_key(&step_marker);
+    let start_idx = lines
+        .iter()
+        .position(|line| normalize_log_match_key(line).contains(&marker_key))
+        .or_else(|| {
+            let step_key = normalize_log_match_key(step_name);
+            lines
+                .iter()
+                .position(|line| normalize_log_match_key(line).contains(&step_key))
+        })
+        .unwrap_or(0);
+    let end_idx = lines
+        .iter()
+        .enumerate()
+        .skip(start_idx + 1)
+        .find(|(_, line)| line.starts_with("##[group]Run "))
+        .map(|(idx, _)| idx)
+        .unwrap_or(lines.len());
+    let mut selected = lines[start_idx..end_idx]
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    while selected.last().is_some_and(|line| line.trim().is_empty()) {
+        selected.pop();
+    }
+    if selected.len() > max_lines {
+        selected = selected[selected.len() - max_lines..].to_vec();
+    }
+    selected
+}
+
+fn normalize_log_match_key(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // fn format_duration(started_at: &DateTime<Utc>, completed_at: &Option<DateTime<Utc>>) -> String {
