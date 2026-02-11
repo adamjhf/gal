@@ -451,14 +451,13 @@ impl WorkflowRunsListWidget {
     fn calculate_column_widths(&self, headers: &[&str], rows: &[RunRow]) -> Vec<Constraint> {
         let mut max_widths = headers
             .iter()
-            .take(3)
+            .take(2)
             .map(|h| UnicodeWidthStr::width(*h))
             .collect::<Vec<_>>();
 
         for row in rows {
-            max_widths[0] = max_widths[0].max(UnicodeWidthStr::width(row.id.as_str()));
-            max_widths[1] = max_widths[1].max(UnicodeWidthStr::width(row.time.as_str()));
-            max_widths[2] = max_widths[2]
+            max_widths[0] = max_widths[0].max(UnicodeWidthStr::width(row.time.as_str()));
+            max_widths[1] = max_widths[1]
                 .max(UnicodeWidthStr::width(row.branch.as_str()))
                 .min(25);
         }
@@ -525,7 +524,7 @@ impl Widget for &WorkflowRunsListWidget {
 
             paragraph.render(table_area, buf);
         } else {
-            let headers = ["ID", "Time", "Branch", "Run"];
+            let headers = ["Time", "Branch", "Run"];
             let header = headers
                 .into_iter()
                 .map(Cell::from)
@@ -541,7 +540,7 @@ impl Widget for &WorkflowRunsListWidget {
                 .iter()
                 .map(|run| run.to_row())
                 .collect::<Vec<RunRow>>();
-            let headers = ["ID", "Time", "Branch", "Run"];
+            let headers = ["Time", "Branch", "Run"];
             let widths = self.calculate_column_widths(&headers, &run_rows);
             let rows = run_rows
                 .into_iter()
@@ -561,7 +560,6 @@ impl Widget for &WorkflowRunsListWidget {
                         row_height
                     };
                     let row: Row = Row::new(vec![
-                        Cell::from(run.id.clone()),
                         Cell::from(run.time.clone()),
                         Cell::from(run.branch.clone()),
                         Cell::from(run.details_lines.clone()),
@@ -632,7 +630,6 @@ impl WorkflowRun {
         }];
 
         RunRow {
-            id: run.id.0.to_string(),
             time: format_relative_time(run.created_at),
             branch: run.branch.clone(),
             details_lines,
@@ -717,7 +714,6 @@ impl WorkflowRun {
 
 #[derive(Debug)]
 struct RunRow {
-    id: String,
     time: String,
     branch: String,
     details_lines: Vec<Line<'static>>,
@@ -869,7 +865,7 @@ fn format_relative_time(dt: DateTime<Utc>) -> String {
             // 1-4 weeks
             let weeks = days / 7;
             match weeks {
-                1 => "last week".to_string(),
+                1 => "1w ago".to_string(),
                 _ => format!("{weeks}w ago"),
             }
         }
@@ -884,7 +880,7 @@ fn format_relative_time(dt: DateTime<Utc>) -> String {
                 months += 12;
             }
             match (years, months) {
-                (0, 1) => "last month".to_string(),
+                (0, 1) => "1m ago".to_string(),
                 (0, months) => format!("{months}mo ago"),
                 (1, _) => "last year".to_string(),
                 (years, _) => format!("{years}y ago"),
