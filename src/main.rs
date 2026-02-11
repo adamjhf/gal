@@ -282,6 +282,7 @@ impl WorkflowRunsListWidget {
         let mut state = self.state.write().unwrap();
         if state.loading_state == LoadingState::Loading {
             state.throbber_state.calc_next();
+            state.data_updated = true;
         }
     }
 
