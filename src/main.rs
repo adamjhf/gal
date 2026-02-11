@@ -10,7 +10,7 @@ use chrono::{DateTime, Datelike, Utc};
 use clap::Parser;
 use color_eyre::{Result, eyre::ErrReport, eyre::eyre};
 use crossterm::event::{Event, EventStream, KeyCode};
-use futures::future::{join_all, try_join_all};
+use futures::future::try_join_all;
 use octocrab::{
     Octocrab,
     models::{
@@ -156,7 +156,7 @@ impl App {
                 KeyCode::Enter => self.workflow_runs.open_selected_workflow(),
                 KeyCode::Char(' ') => {
                     let runs = Arc::new(self.workflow_runs.clone());
-                    runs.toggle_selected_workflow()
+                    runs.toggle_job_breakdown_pane()
                 }
                 _ => {}
             }
@@ -180,6 +180,7 @@ struct WorkflowRunsListState {
     throbber_state: ThrobberState,
     completed_workflow_jobs: HashMap<u64, Vec<Job>>,
     data_updated: bool,
+    show_job_breakdown_pane: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -201,8 +202,10 @@ impl WorkflowRunsListWidget {
     }
 
     fn new(client: Octocrab, repo: GitHubRepo, branches: Option<Vec<String>>) -> Self {
+        let mut state = WorkflowRunsListState::default();
+        state.show_job_breakdown_pane = true;
         Self {
-            state: Default::default(),
+            state: Arc::new(RwLock::new(state)),
             client,
             repo,
             branches,
@@ -228,7 +231,6 @@ impl WorkflowRunsListWidget {
     }
 
     fn on_load(self: Arc<Self>, runs: Vec<WorkflowRun>) {
-        let this = self.clone();
         let mut state = self.state.write().unwrap();
         state.loading_state = LoadingState::Loaded;
         let was_empty = state.workflow_runs.is_empty();
@@ -237,47 +239,8 @@ impl WorkflowRunsListWidget {
         if !state.workflow_runs.is_empty() && was_empty {
             state.table_state.select(Some(0));
         }
-        tokio::spawn(this.load_jobs());
-    }
-
-    async fn load_jobs(self: Arc<Self>) {
-        let runs = {
-            let mut state = self.state.write().unwrap();
-            state
-                .workflow_runs
-                .iter_mut()
-                .filter(|run| {
-                    run.show_jobs
-                        && (run.status.as_str() == "in_progress"
-                            || !matches!(run.jobs, JobsState::Loaded(_)))
-                })
-                .map(|run| {
-                    if run.jobs == JobsState::NotLoaded {
-                        run.jobs = JobsState::Loading;
-                    }
-                    (run.id, run.status == "completed")
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let futures = runs.into_iter().map(|run| {
-            let this = self.clone();
-            async move {
-                match this.get_workflow_jobs(run.0, run.1).await {
-                    Ok(jobs) => (run.0, JobsState::Loaded(jobs)),
-                    Err(err) => (run.0, JobsState::LoadingError(err.to_string())),
-                }
-            }
-        });
-        let jobs_states = join_all(futures).await;
-
-        let mut state = self.state.write().unwrap();
-        for (id, jobs_state) in jobs_states {
-            if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == id) {
-                run.jobs = jobs_state;
-            }
-        }
-        state.data_updated = true;
+        drop(state);
+        self.ensure_selected_workflow_jobs();
     }
 
     fn on_err(&self, err: &ErrReport) {
@@ -296,11 +259,25 @@ impl WorkflowRunsListWidget {
     }
 
     fn scroll_down(&self) {
-        self.state.write().unwrap().table_state.scroll_down_by(1);
+        let should_load = {
+            let mut state = self.state.write().unwrap();
+            state.table_state.scroll_down_by(1);
+            state.show_job_breakdown_pane
+        };
+        if should_load {
+            Arc::new(self.clone()).ensure_selected_workflow_jobs();
+        }
     }
 
     fn scroll_up(&self) {
-        self.state.write().unwrap().table_state.scroll_up_by(1);
+        let should_load = {
+            let mut state = self.state.write().unwrap();
+            state.table_state.scroll_up_by(1);
+            state.show_job_breakdown_pane
+        };
+        if should_load {
+            Arc::new(self.clone()).ensure_selected_workflow_jobs();
+        }
     }
 
     async fn get_detailed_workflow_runs(&self) -> Result<Vec<WorkflowRun>> {
@@ -316,23 +293,12 @@ impl WorkflowRunsListWidget {
             state
                 .workflow_runs
                 .iter()
-                .map(|run| (run.id, (run.show_jobs, run.jobs.clone())))
-                .collect::<HashMap<RunId, (bool, JobsState)>>()
+                .map(|run| (run.id, run.jobs.clone()))
+                .collect::<HashMap<RunId, JobsState>>()
         });
         let details_futures = workflows.into_iter().map(|run| {
             let existing_workflow_runs = existing_workflow_runs.clone();
             async move {
-                let show_jobs_default = matches!(
-                    run.conclusion
-                        .clone()
-                        .unwrap_or(run.status.clone())
-                        .as_str(),
-                    "failure" | "in_progress" | "queued"
-                );
-                let show_jobs = match existing_workflow_runs.get(&run.id) {
-                    Some((show_jobs, _)) => *show_jobs,
-                    None => show_jobs_default,
-                };
                 WorkflowRun {
                     id: run.id,
                     name: run.name,
@@ -340,10 +306,8 @@ impl WorkflowRunsListWidget {
                     branch: run.head_branch.to_string(),
                     status: run.status,
                     conclusion: run.conclusion,
-                    show_jobs,
                     jobs: match existing_workflow_runs.get(&run.id) {
-                        Some((true, JobsState::Loaded(jobs))) => JobsState::Reloading(jobs.clone()),
-                        Some((_, jobs)) => jobs.clone(),
+                        Some(jobs) => jobs.clone(),
                         None => JobsState::NotLoaded,
                     },
                     created_at: run.created_at,
@@ -414,34 +378,60 @@ impl WorkflowRunsListWidget {
         Ok(runs)
     }
 
-    fn toggle_selected_workflow(self: Arc<Self>) {
+    fn toggle_job_breakdown_pane(self: Arc<Self>) {
         let mut state = self.state.write().unwrap();
-        if let Some(selected_index) = state.table_state.selected()
-            && let Some(run) = state.workflow_runs.get_mut(selected_index)
-        {
-            let this = self.clone();
-            let run_id = run.id;
-            let is_completed = run.status.as_str() == "completed";
-            run.show_jobs = !run.show_jobs;
-            if run.show_jobs {
-                if run.jobs == JobsState::NotLoaded {
-                    run.jobs = JobsState::Loading;
-                }
-                let state_arc = self.state.clone();
-                tokio::spawn(async move {
-                    let jobs_state = match this.get_workflow_jobs(run_id, is_completed).await {
-                        Ok(jobs) => JobsState::Loaded(jobs),
-                        Err(err) => JobsState::LoadingError(err.to_string()),
-                    };
-                    let mut state = state_arc.write().unwrap();
-                    if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == run_id) {
-                        run.jobs = jobs_state;
-                        state.data_updated = true;
-                    }
-                });
-            }
-            state.data_updated = true;
+        state.show_job_breakdown_pane = !state.show_job_breakdown_pane;
+        state.data_updated = true;
+        let should_load = state.show_job_breakdown_pane;
+        drop(state);
+        if should_load {
+            self.ensure_selected_workflow_jobs();
         }
+    }
+
+    fn ensure_selected_workflow_jobs(self: Arc<Self>) {
+        let (run_id, is_completed) = {
+            let mut state = self.state.write().unwrap();
+            let Some(selected_index) = state.table_state.selected() else {
+                return;
+            };
+            let Some(run) = state.workflow_runs.get_mut(selected_index) else {
+                return;
+            };
+            let should_fetch = match &run.jobs {
+                JobsState::Loading | JobsState::Reloading(_) => false,
+                JobsState::NotLoaded => {
+                    run.jobs = JobsState::Loading;
+                    true
+                }
+                JobsState::LoadingError(_) => {
+                    run.jobs = JobsState::Loading;
+                    true
+                }
+                JobsState::Loaded(jobs) if run.status.as_str() == "in_progress" => {
+                    run.jobs = JobsState::Reloading(jobs.clone());
+                    true
+                }
+                JobsState::Loaded(_) => false,
+            };
+            if !should_fetch {
+                return;
+            }
+            (run.id, run.status.as_str() == "completed")
+        };
+        let this = self.clone();
+        let state_arc = self.state.clone();
+        tokio::spawn(async move {
+            let jobs_state = match this.get_workflow_jobs(run_id, is_completed).await {
+                Ok(jobs) => JobsState::Loaded(jobs),
+                Err(err) => JobsState::LoadingError(err.to_string()),
+            };
+            let mut state = state_arc.write().unwrap();
+            if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == run_id) {
+                run.jobs = jobs_state;
+                state.data_updated = true;
+            }
+        });
     }
 
     fn open_selected_workflow(&self) {
@@ -458,7 +448,7 @@ impl WorkflowRunsListWidget {
         }
     }
 
-    fn calculate_column_widths(&self, headers: &[&str], rows: &Vec<RunRow>) -> Vec<Constraint> {
+    fn calculate_column_widths(&self, headers: &[&str], rows: &[RunRow]) -> Vec<Constraint> {
         let mut max_widths = headers
             .iter()
             .take(3)
@@ -486,28 +476,39 @@ impl Widget for &WorkflowRunsListWidget {
         let mut state = self.state.write().unwrap();
 
         let white = Style::default().fg(Color::White);
-        let mut block = Block::bordered()
-            .title(self.repo.full_name())
-            .title_bottom(Line::from(vec![
-                Span::styled("j/k", white),
-                Span::from(" up/down  "),
-                Span::styled("space", white),
-                Span::from(" show jobs/steps  "),
-                Span::styled("enter", white),
-                Span::from(" open browser  "),
-                Span::styled("q", white),
-                Span::from(" quit"),
-            ]));
+        let mut table_block =
+            Block::bordered()
+                .title(self.repo.full_name())
+                .title_bottom(Line::from(vec![
+                    Span::styled("j/k", white),
+                    Span::from(" up/down  "),
+                    Span::styled("space", white),
+                    Span::from(" toggle job pane  "),
+                    Span::styled("enter", white),
+                    Span::from(" open browser  "),
+                    Span::styled("q", white),
+                    Span::from(" quit"),
+                ]));
 
-        block = match &state.loading_state {
+        table_block = match &state.loading_state {
             LoadingState::Loading => {
                 let throbber = Throbber::default().throbber_set(throbber_widgets_tui::BRAILLE_ONE);
                 let throbber_span = throbber.to_symbol_span(&state.throbber_state);
                 let throbber_text = throbber_span.content.as_ref().trim_end().to_string();
-                block.title(Line::from(throbber_text).right_aligned())
+                table_block.title(Line::from(throbber_text).right_aligned())
             }
-            LoadingState::Error(_) => block.title(Line::from("Error").right_aligned()),
-            _ => block,
+            LoadingState::Error(_) => table_block.title(Line::from("Error").right_aligned()),
+            _ => table_block,
+        };
+
+        let (table_area, jobs_area) = if state.show_job_breakdown_pane {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+                .split(area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (area, None)
         };
 
         if state.workflow_runs.is_empty() {
@@ -519,10 +520,10 @@ impl Widget for &WorkflowRunsListWidget {
             };
 
             let paragraph = Paragraph::new(Text::from(loading_message))
-                .block(block)
+                .block(table_block)
                 .wrap(ratatui::widgets::Wrap { trim: true });
 
-            paragraph.render(area, buf);
+            paragraph.render(table_area, buf);
         } else {
             let headers = ["ID", "Time", "Branch", "Run"];
             let header = headers
@@ -531,11 +532,15 @@ impl Widget for &WorkflowRunsListWidget {
                 .collect::<Row>()
                 .style(Style::new().bold())
                 .height(1);
-            let max_height = area.height as i32 - 3; // 1 header and 2 border
+            let max_height = table_area.height as i32 - 3; // 1 header and 2 border
             let offset = state.table_state.offset();
             let mut consumed_height = 0;
 
-            let run_rows = state.workflow_runs.iter().map(|run| run.to_row()).collect();
+            let run_rows = state
+                .workflow_runs
+                .iter()
+                .map(|run| run.to_row())
+                .collect::<Vec<RunRow>>();
             let headers = ["ID", "Time", "Branch", "Run"];
             let widths = self.calculate_column_widths(&headers, &run_rows);
             let rows = run_rows
@@ -565,32 +570,28 @@ impl Widget for &WorkflowRunsListWidget {
                 })
                 .collect::<Vec<_>>();
             let table = Table::new(rows, widths)
-                .block(block)
+                .block(table_block)
                 .header(header)
                 .highlight_spacing(HighlightSpacing::Always)
                 .highlight_symbol("> ")
                 .row_highlight_style(Style::new().on_black().bold());
 
-            StatefulWidget::render(table, area, buf, &mut state.table_state);
+            StatefulWidget::render(table, table_area, buf, &mut state.table_state);
         }
-    }
-}
 
-#[derive(Debug, Clone)]
-struct ColoredText {
-    prefix: String,
-    text: String,
-    suffix: String,
-    color: Color,
-}
-
-impl ColoredText {
-    fn new(prefix: String, text: String, suffix: String, color: Color) -> Self {
-        Self {
-            prefix,
-            text,
-            suffix,
-            color,
+        if let Some(jobs_area) = jobs_area {
+            let jobs_lines = state
+                .table_state
+                .selected()
+                .and_then(|selected_index| state.workflow_runs.get(selected_index))
+                .map_or_else(
+                    || vec![Line::from("No workflow selected")],
+                    WorkflowRun::job_breakdown_lines,
+                );
+            let jobs_paragraph = Paragraph::new(Text::from(jobs_lines))
+                .block(Block::bordered().title("Job Breakdown"))
+                .wrap(ratatui::widgets::Wrap { trim: true });
+            jobs_paragraph.render(jobs_area, buf);
         }
     }
 }
@@ -604,7 +605,6 @@ struct WorkflowRun {
     status: String,
     conclusion: Option<String>,
     jobs: JobsState,
-    show_jobs: bool,
     #[allow(dead_code)]
     created_at: DateTime<Utc>,
     html_url: String,
@@ -620,93 +620,16 @@ enum JobsState {
 }
 
 impl WorkflowRun {
-    fn to_row<'a>(&self) -> RunRow<'a> {
+    fn to_row(&self) -> RunRow {
         let run = self;
 
-        let mut details_lines = vec![{
+        let details_lines = vec![{
             let status_symbol = get_run_status_symbol(&run.status, &run.conclusion);
             Line::styled(
                 format!("{} {} - {}", status_symbol.symbol, run.name, run.commit),
                 Style::default().fg(status_symbol.color),
             )
         }];
-        if run.show_jobs {
-            let jobs_details = match &run.jobs {
-                JobsState::NotLoaded => vec![Line::from("  Jobs not loaded")],
-                JobsState::Loading => vec![Line::from("  Loading jobs...")],
-                JobsState::LoadingError(err) => {
-                    vec![Line::from(format!("  Error loading jobs: {err:?}"))]
-                }
-                JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => {
-                    let mut all_items = Vec::new();
-
-                    for (job_index, job) in jobs.iter().enumerate() {
-                        let is_last_job = job_index == jobs.len() - 1;
-                        let job_prefix = if is_last_job { "└─ " } else { "├─ " };
-                        let job_status = get_job_status_symbol(&job.status, &job.conclusion);
-                        let duration = match (&job.status, job.completed_at) {
-                            (Status::InProgress, _) => format_duration(job.started_at, Utc::now()),
-                            (_, Some(completed)) => format_duration(job.started_at, completed),
-                            _ => String::new(),
-                        };
-                        all_items.push(ColoredText::new(
-                            job_prefix.into(),
-                            format!("{} {}", job_status.symbol, job.name),
-                            duration,
-                            job_status.color,
-                        ));
-
-                        for (step_index, step) in job.steps.iter().enumerate() {
-                            let is_last_step = step_index == job.steps.len() - 1;
-                            let step_prefix = if is_last_job {
-                                if is_last_step {
-                                    "   └─ "
-                                } else {
-                                    "   ├─ "
-                                }
-                            } else if is_last_step {
-                                "│  └─ "
-                            } else {
-                                "│  ├─ "
-                            };
-
-                            let status = get_job_status_symbol(&step.status, &step.conclusion);
-                            let duration = match (&step.status, step.started_at, step.completed_at)
-                            {
-                                (Status::InProgress, Some(started), _) => {
-                                    format_duration(started, Utc::now())
-                                }
-                                (_, Some(started), Some(completed)) => {
-                                    format_duration(started, completed)
-                                }
-                                _ => String::new(),
-                            };
-                            all_items.push(ColoredText::new(
-                                step_prefix.into(),
-                                format!("{} {}", status.symbol, step.name),
-                                duration,
-                                status.color,
-                            ));
-                        }
-                    }
-
-                    all_items
-                        .into_iter()
-                        .map(|ct| {
-                            Line::from(vec![
-                                Span::styled(ct.prefix, Style::default().fg(Color::DarkGray)),
-                                Span::styled(ct.text, Style::default().fg(ct.color)),
-                                Span::styled(
-                                    format!(" {}", ct.suffix),
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                            ])
-                        })
-                        .collect::<Vec<_>>()
-                }
-            };
-            details_lines.extend(jobs_details);
-        };
 
         RunRow {
             id: run.id.0.to_string(),
@@ -715,14 +638,89 @@ impl WorkflowRun {
             details_lines,
         }
     }
+
+    fn job_breakdown_lines(&self) -> Vec<Line<'static>> {
+        match &self.jobs {
+            JobsState::NotLoaded => vec![Line::from("Loading not started")],
+            JobsState::Loading => vec![Line::from("Loading jobs...")],
+            JobsState::LoadingError(err) => vec![Line::from(format!("Error loading jobs: {err}"))],
+            JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => {
+                if jobs.is_empty() {
+                    return vec![Line::from("No jobs in this run")];
+                }
+                let mut all_items = vec![Line::styled(
+                    format!("{} ({})", self.name, self.id.0),
+                    Style::default().fg(Color::White).bold(),
+                )];
+
+                for (job_index, job) in jobs.iter().enumerate() {
+                    let is_last_job = job_index == jobs.len() - 1;
+                    let job_prefix = if is_last_job { "└─ " } else { "├─ " };
+                    let job_status = get_job_status_symbol(&job.status, &job.conclusion);
+                    let duration = match (&job.status, job.completed_at) {
+                        (Status::InProgress, _) => format_duration(job.started_at, Utc::now()),
+                        (_, Some(completed)) => format_duration(job.started_at, completed),
+                        _ => String::new(),
+                    };
+                    all_items.push(Self::job_line(
+                        job_prefix.into(),
+                        format!("{} {}", job_status.symbol, job.name),
+                        duration,
+                        job_status.color,
+                    ));
+
+                    for (step_index, step) in job.steps.iter().enumerate() {
+                        let is_last_step = step_index == job.steps.len() - 1;
+                        let step_prefix = if is_last_job {
+                            if is_last_step {
+                                "   └─ "
+                            } else {
+                                "   ├─ "
+                            }
+                        } else if is_last_step {
+                            "│  └─ "
+                        } else {
+                            "│  ├─ "
+                        };
+
+                        let status = get_job_status_symbol(&step.status, &step.conclusion);
+                        let duration = match (&step.status, step.started_at, step.completed_at) {
+                            (Status::InProgress, Some(started), _) => {
+                                format_duration(started, Utc::now())
+                            }
+                            (_, Some(started), Some(completed)) => {
+                                format_duration(started, completed)
+                            }
+                            _ => String::new(),
+                        };
+                        all_items.push(Self::job_line(
+                            step_prefix.into(),
+                            format!("{} {}", status.symbol, step.name),
+                            duration,
+                            status.color,
+                        ));
+                    }
+                }
+                all_items
+            }
+        }
+    }
+
+    fn job_line(prefix: String, text: String, suffix: String, color: Color) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+            Span::styled(text, Style::default().fg(color)),
+            Span::styled(format!(" {}", suffix), Style::default().fg(Color::DarkGray)),
+        ])
+    }
 }
 
 #[derive(Debug)]
-struct RunRow<'a> {
+struct RunRow {
     id: String,
     time: String,
     branch: String,
-    details_lines: Vec<Line<'a>>,
+    details_lines: Vec<Line<'static>>,
 }
 
 struct StatusDisplay {
