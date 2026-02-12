@@ -10,7 +10,10 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, Utc};
 use clap::Parser;
 use color_eyre::{Result, eyre::ErrReport, eyre::eyre};
-use crossterm::event::{Event, EventStream, KeyCode};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, MouseButton,
+    MouseEventKind,
+};
 use futures::future::try_join_all;
 use octocrab::{
     Octocrab,
@@ -72,7 +75,9 @@ async fn main() -> Result<()> {
     debug!("initialising app");
     color_eyre::install()?;
     let terminal = ratatui::init();
+    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
     let app_result = App::new(args).run(terminal).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     app_result
 }
@@ -151,8 +156,8 @@ impl App {
     }
 
     fn handle_event(&mut self, event: &Event) {
-        if let Some(key) = event.as_key_press_event() {
-            match key.code {
+        match event {
+            Event::Key(key) if key.kind.is_press() => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
                 KeyCode::Char('j') | KeyCode::Down => self.workflow_runs.scroll_down(),
                 KeyCode::Char('k') | KeyCode::Up => self.workflow_runs.scroll_up(),
@@ -174,7 +179,14 @@ impl App {
                     runs.toggle_job_breakdown_pane()
                 }
                 _ => {}
+            },
+            Event::Mouse(mouse) => {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    let runs = Arc::new(self.workflow_runs.clone());
+                    runs.select_row_at(mouse.column, mouse.row);
+                }
             }
+            _ => {}
         }
     }
 }
@@ -196,8 +208,17 @@ struct WorkflowRunsListState {
     completed_workflow_jobs: HashMap<u64, Vec<Job>>,
     pending_reruns: HashMap<u64, PendingRerunMarker>,
     selected_run_attempts: HashMap<u64, u32>,
+    table_area: Option<Rect>,
+    visible_row_hitboxes: Vec<VisibleWorkflowRow>,
     data_updated: bool,
     show_job_breakdown_pane: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VisibleWorkflowRow {
+    index: usize,
+    y_start: u16,
+    y_end: u16,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -424,6 +445,40 @@ impl WorkflowRunsListWidget {
         };
 
         if should_reload_failed_log {
+            self.ensure_selected_failed_step_log();
+        }
+    }
+
+    fn select_row_at(self: Arc<Self>, column: u16, row: u16) {
+        let should_load = {
+            let mut state = self.state.write().unwrap();
+            let Some(table_area) = state.table_area else {
+                return;
+            };
+            if column < table_area.x
+                || column >= table_area.x.saturating_add(table_area.width)
+                || row < table_area.y
+                || row >= table_area.y.saturating_add(table_area.height)
+            {
+                return;
+            }
+            let Some(hit) = state
+                .visible_row_hitboxes
+                .iter()
+                .find(|hit| row >= hit.y_start && row <= hit.y_end)
+                .copied()
+            else {
+                return;
+            };
+            if state.table_state.selected() == Some(hit.index) {
+                return;
+            }
+            state.table_state.select(Some(hit.index));
+            state.data_updated = true;
+            state.show_job_breakdown_pane
+        };
+        if should_load {
+            self.clone().ensure_selected_workflow_jobs();
             self.ensure_selected_failed_step_log();
         }
     }
@@ -853,6 +908,41 @@ impl WorkflowRunsListWidget {
             .chain(std::iter::once(Constraint::Min(20)))
             .collect()
     }
+
+    fn compute_visible_row_hitboxes(
+        &self,
+        table_area: Rect,
+        offset: usize,
+        rows: &[RunRow],
+    ) -> Vec<VisibleWorkflowRow> {
+        if table_area.height <= 3 || offset >= rows.len() {
+            return vec![];
+        }
+
+        let mut remaining = table_area.height.saturating_sub(3);
+        let mut y = table_area.y.saturating_add(2);
+        let mut hitboxes = Vec::new();
+
+        for (index, row) in rows.iter().enumerate().skip(offset) {
+            if remaining == 0 {
+                break;
+            }
+            let row_height = row.height() as u16;
+            if row_height == 0 {
+                continue;
+            }
+            let visible_height = row_height.min(remaining);
+            hitboxes.push(VisibleWorkflowRow {
+                index,
+                y_start: y,
+                y_end: y.saturating_add(visible_height.saturating_sub(1)),
+            });
+            y = y.saturating_add(visible_height);
+            remaining = remaining.saturating_sub(visible_height);
+        }
+
+        hitboxes
+    }
 }
 
 impl Widget for &WorkflowRunsListWidget {
@@ -900,6 +990,8 @@ impl Widget for &WorkflowRunsListWidget {
         };
 
         if state.workflow_runs.is_empty() {
+            state.table_area = Some(table_area);
+            state.visible_row_hitboxes.clear();
             let loading_message = match &state.loading_state {
                 LoadingState::Loading => "Loading workflow runs from GitHub...",
                 LoadingState::Error(err) => err.as_str(),
@@ -929,6 +1021,9 @@ impl Widget for &WorkflowRunsListWidget {
                 .iter()
                 .map(|run| run.to_row())
                 .collect::<Vec<RunRow>>();
+            state.table_area = Some(table_area);
+            state.visible_row_hitboxes =
+                self.compute_visible_row_hitboxes(table_area, offset, &run_rows);
             let headers = ["Time", "Branch", "Workflow", "Commit"];
             let widths = self.calculate_column_widths(&headers, &run_rows);
             let rows = run_rows
