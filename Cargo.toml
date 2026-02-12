@@ -1,6 +1,6 @@
 [package]
 name = "gal-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Adam Freeth <git@freeth.dev>"]
 description = "A terminal-based live monitor for GitHub Actions"
