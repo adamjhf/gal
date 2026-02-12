@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
@@ -119,6 +119,10 @@ impl App {
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+        if let Ok((_, rows)) = crossterm::terminal::size() {
+            self.workflow_runs
+                .set_min_runs_to_fetch(rows.saturating_sub(3) as usize);
+        }
         self.workflow_runs.run();
 
         let period = Duration::from_secs_f32(1.0 / Self::FRAMES_PER_SECOND);
@@ -210,6 +214,7 @@ struct WorkflowRunsListState {
     selected_run_attempts: HashMap<u64, u32>,
     table_area: Option<Rect>,
     visible_row_hitboxes: Vec<VisibleWorkflowRow>,
+    min_runs_to_fetch: usize,
     data_updated: bool,
     show_job_breakdown_pane: bool,
 }
@@ -261,6 +266,8 @@ enum FailedStepLogState {
 impl WorkflowRunsListWidget {
     const FAILED_LOG_TAIL_LINES: usize = 100;
     const RERUN_STATUS_REFRESH_DELAY: Duration = Duration::from_secs(3);
+    const DEFAULT_MIN_RUNS_TO_FETCH: usize = 30;
+    const RUNS_FETCH_BATCH_SIZE: u8 = 30;
 
     fn has_data_updates(&self) -> bool {
         self.state.read().unwrap().data_updated
@@ -270,9 +277,15 @@ impl WorkflowRunsListWidget {
         self.state.write().unwrap().data_updated = data_updated;
     }
 
+    fn set_min_runs_to_fetch(&self, min_runs_to_fetch: usize) {
+        self.state.write().unwrap().min_runs_to_fetch =
+            min_runs_to_fetch.max(Self::DEFAULT_MIN_RUNS_TO_FETCH);
+    }
+
     fn new(client: Octocrab, repo: GitHubRepo, branches: Option<Vec<String>>) -> Self {
         let state = WorkflowRunsListState {
             show_job_breakdown_pane: true,
+            min_runs_to_fetch: Self::DEFAULT_MIN_RUNS_TO_FETCH,
             ..Default::default()
         };
         Self {
@@ -293,8 +306,20 @@ impl WorkflowRunsListWidget {
         loop {
             self.set_loading_state(LoadingState::Loading);
             let this = self.clone();
-            match self.get_detailed_workflow_runs().await {
-                Ok(runs) => this.on_load(runs),
+            let is_initial_load = self.state.read().unwrap().workflow_runs.is_empty();
+            match self.get_detailed_workflow_runs(false).await {
+                Ok(runs) => {
+                    if is_initial_load {
+                        this.clone().on_load(runs);
+                        if self.state.read().unwrap().min_runs_to_fetch
+                            > Self::RUNS_FETCH_BATCH_SIZE as usize
+                        {
+                            this.load_remaining_initial_runs();
+                        }
+                    } else {
+                        this.on_load_first_batch(runs);
+                    }
+                }
                 Err(err) => self.on_err(&err),
             }
             interval.tick().await;
@@ -340,6 +365,39 @@ impl WorkflowRunsListWidget {
         drop(state);
         self.clone().ensure_selected_workflow_jobs();
         self.ensure_selected_failed_step_log();
+    }
+
+    fn on_load_first_batch(self: Arc<Self>, first_batch_runs: Vec<WorkflowRun>) {
+        let merged_runs = {
+            let state = self.state.read().unwrap();
+            if state.workflow_runs.is_empty() {
+                first_batch_runs
+            } else {
+                let first_batch_ids = first_batch_runs
+                    .iter()
+                    .map(|run| run.id.0)
+                    .collect::<HashSet<_>>();
+                let mut merged = first_batch_runs;
+                merged.extend(
+                    state
+                        .workflow_runs
+                        .iter()
+                        .filter(|run| !first_batch_ids.contains(&run.id.0))
+                        .cloned(),
+                );
+                merged
+            }
+        };
+        self.on_load(merged_runs);
+    }
+
+    fn load_remaining_initial_runs(self: Arc<Self>) {
+        tokio::spawn(async move {
+            match self.get_detailed_workflow_runs(true).await {
+                Ok(runs) => self.clone().on_load(runs),
+                Err(err) => self.on_err(&err),
+            }
+        });
     }
 
     fn on_err(&self, err: &ErrReport) {
@@ -483,8 +541,8 @@ impl WorkflowRunsListWidget {
         }
     }
 
-    async fn get_detailed_workflow_runs(&self) -> Result<Vec<WorkflowRun>> {
-        let workflows = match self.get_workflow_runs().await {
+    async fn get_detailed_workflow_runs(&self, fetch_to_target: bool) -> Result<Vec<WorkflowRun>> {
+        let workflows = match self.get_workflow_runs(fetch_to_target).await {
             Ok(runs) => runs,
             Err(err) => {
                 error!("{:?}", err);
@@ -588,18 +646,19 @@ impl WorkflowRunsListWidget {
         Ok(jobs)
     }
 
-    async fn get_workflow_runs(&self) -> Result<Vec<Run>> {
+    async fn get_workflow_runs(&self, fetch_to_target: bool) -> Result<Vec<Run>> {
         debug!("fetching workflow runs");
+        let min_runs_to_fetch = self.state.read().unwrap().min_runs_to_fetch;
         let runs = match &self.branches {
             Some(branches) => {
+                let per_branch_target = if fetch_to_target {
+                    min_runs_to_fetch.div_ceil(branches.len().max(1))
+                } else {
+                    Self::RUNS_FETCH_BATCH_SIZE as usize
+                };
                 let futures = branches.iter().map(|branch| async move {
-                    self.client
-                        .workflows(&self.repo.owner, &self.repo.name)
-                        .list_all_runs()
-                        .branch(branch)
-                        .send()
+                    self.fetch_runs_for_branch(Some(branch), per_branch_target, fetch_to_target)
                         .await
-                        .map(|resp| resp.items)
                 });
                 let results = try_join_all(futures).await?;
                 let mut runs = results.into_iter().flatten().collect::<Vec<_>>();
@@ -607,14 +666,40 @@ impl WorkflowRunsListWidget {
                 runs
             }
             None => {
-                self.client
-                    .workflows(&self.repo.owner, &self.repo.name)
-                    .list_all_runs()
-                    .send()
+                self.fetch_runs_for_branch(None, min_runs_to_fetch, fetch_to_target)
                     .await?
-                    .items
             }
         };
+        Ok(runs)
+    }
+
+    async fn fetch_runs_for_branch(
+        &self,
+        branch: Option<&str>,
+        min_runs_to_fetch: usize,
+        fetch_to_target: bool,
+    ) -> Result<Vec<Run>> {
+        let per_page = Self::RUNS_FETCH_BATCH_SIZE;
+        let target = min_runs_to_fetch.max(Self::DEFAULT_MIN_RUNS_TO_FETCH);
+        let mut page = 1u32;
+        let mut runs = Vec::new();
+
+        loop {
+            let workflows = self.client.workflows(&self.repo.owner, &self.repo.name);
+            let mut builder = workflows.list_all_runs().per_page(per_page).page(page);
+            if let Some(branch) = branch {
+                builder = builder.branch(branch);
+            }
+            let response = builder.send().await?;
+            let has_next_page = response.next.is_some();
+            runs.extend(response.items);
+
+            if !fetch_to_target || runs.len() >= target || !has_next_page {
+                break;
+            }
+            page += 1;
+        }
+
         Ok(runs)
     }
 
@@ -698,8 +783,8 @@ impl WorkflowRunsListWidget {
         tokio::spawn(async move {
             sleep(delay).await;
             self.set_loading_state(LoadingState::Loading);
-            match self.get_detailed_workflow_runs().await {
-                Ok(runs) => self.clone().on_load(runs),
+            match self.get_detailed_workflow_runs(false).await {
+                Ok(runs) => self.clone().on_load_first_batch(runs),
                 Err(err) => self.on_err(&err),
             }
         });
@@ -988,6 +1073,10 @@ impl Widget for &WorkflowRunsListWidget {
         } else {
             (area, None)
         };
+        let visible_row_target = table_area.height.saturating_sub(3) as usize;
+        state.min_runs_to_fetch = state
+            .min_runs_to_fetch
+            .max(visible_row_target.max(WorkflowRunsListWidget::DEFAULT_MIN_RUNS_TO_FETCH));
 
         if state.workflow_runs.is_empty() {
             state.table_area = Some(table_area);
