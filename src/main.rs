@@ -23,7 +23,7 @@ use ratatui::DefaultTerminal;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Cell, HighlightSpacing, Paragraph, Row, Table, TableState};
 use throbber_widgets_tui::{Throbber, ThrobberState};
-use tokio::time::{Instant, interval};
+use tokio::time::{Instant, interval, sleep};
 use tokio_stream::StreamExt;
 use tracing::{debug, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -185,6 +185,7 @@ struct WorkflowRunsListState {
     table_state: TableState,
     throbber_state: ThrobberState,
     completed_workflow_jobs: HashMap<u64, Vec<Job>>,
+    pending_reruns: HashMap<u64, PendingRerunMarker>,
     data_updated: bool,
     show_job_breakdown_pane: bool,
 }
@@ -206,6 +207,12 @@ struct FailedStepRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRerunMarker {
+    workflow_name: String,
+    branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FailedStepLogTail {
     failed_step: FailedStepRef,
     lines: Vec<String>,
@@ -222,6 +229,7 @@ enum FailedStepLogState {
 
 impl WorkflowRunsListWidget {
     const FAILED_LOG_TAIL_LINES: usize = 100;
+    const RERUN_STATUS_REFRESH_DELAY: Duration = Duration::from_secs(3);
 
     fn has_data_updates(&self) -> bool {
         self.state.read().unwrap().data_updated
@@ -324,6 +332,32 @@ impl WorkflowRunsListWidget {
                 return Err(err);
             }
         };
+        let pending_reruns = {
+            let state = self.state.read().unwrap();
+            state.pending_reruns.clone()
+        };
+        let resolved_pending_rerun_ids = pending_reruns
+            .iter()
+            .filter_map(|(source_run_id, marker)| {
+                let started = workflows.iter().any(|run| {
+                    run.id.0 > *source_run_id
+                        && run.name == marker.workflow_name
+                        && run.head_branch == marker.branch
+                        && matches!(run.status.as_str(), "queued" | "in_progress" | "pending")
+                });
+                if started { Some(*source_run_id) } else { None }
+            })
+            .collect::<Vec<_>>();
+        if !resolved_pending_rerun_ids.is_empty() {
+            let mut state = self.state.write().unwrap();
+            for source_run_id in resolved_pending_rerun_ids {
+                state.pending_reruns.remove(&source_run_id);
+            }
+        }
+        let active_pending_reruns = {
+            let state = self.state.read().unwrap();
+            state.pending_reruns.clone()
+        };
         let existing_workflow_runs = Arc::new({
             let state = self.state.read().unwrap();
             state
@@ -334,6 +368,7 @@ impl WorkflowRunsListWidget {
         });
         let details_futures = workflows.into_iter().map(|run| {
             let existing_workflow_runs = existing_workflow_runs.clone();
+            let active_pending_reruns = active_pending_reruns.clone();
             async move {
                 WorkflowRun {
                     id: run.id,
@@ -350,7 +385,9 @@ impl WorkflowRunsListWidget {
                         Some((_, failed_step_log)) => failed_step_log.clone(),
                         None => FailedStepLogState::NotLoaded,
                     },
+                    rerun_refresh_pending: active_pending_reruns.contains_key(&run.id.0),
                     created_at: run.created_at,
+                    updated_at: run.updated_at,
                     html_url: run.html_url.clone().into(),
                 }
             }
@@ -360,9 +397,11 @@ impl WorkflowRunsListWidget {
     }
 
     async fn get_workflow_jobs(&self, run_id: RunId, is_completed: bool) -> Result<Vec<Job>> {
-        let existing_jobs = {
+        let existing_jobs = if is_completed {
             let state = self.state.read().unwrap();
             state.completed_workflow_jobs.get(&run_id.0).cloned()
+        } else {
+            None
         };
         let jobs = match existing_jobs {
             Some(jobs) => jobs,
@@ -420,19 +459,50 @@ impl WorkflowRunsListWidget {
 
     fn rerun_selected_workflow(self: Arc<Self>) {
         let run_id = {
-            let state = self.state.read().unwrap();
+            let mut state = self.state.write().unwrap();
             let Some(selected_index) = state.table_state.selected() else {
                 return;
             };
             let Some(run) = state.workflow_runs.get(selected_index) else {
                 return;
             };
-            run.id
+            let run_id = run.id;
+            let workflow_name = run.name.clone();
+            let branch = run.branch.clone();
+            state.pending_reruns.insert(
+                run_id.0,
+                PendingRerunMarker {
+                    workflow_name,
+                    branch,
+                },
+            );
+            if let Some(run) = state.workflow_runs.get_mut(selected_index) {
+                run.rerun_refresh_pending = true;
+            }
+            state.data_updated = true;
+            run_id
         };
+        let state_arc = self.state.clone();
         tokio::spawn(async move {
             if let Err(err) = self.rerun_workflow_run(run_id).await {
                 error!("failed to rerun workflow {}: {}", run_id.0, err);
+                let mut state = state_arc.write().unwrap();
+                state.pending_reruns.remove(&run_id.0);
+                if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == run_id) {
+                    run.rerun_refresh_pending = false;
+                    state.data_updated = true;
+                }
+                return;
             }
+            let mut state = state_arc.write().unwrap();
+            state.completed_workflow_jobs.remove(&run_id.0);
+            if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == run_id) {
+                run.jobs = JobsState::NotLoaded;
+                run.failed_step_log = FailedStepLogState::NotLoaded;
+                state.data_updated = true;
+            }
+            drop(state);
+            self.refresh_runs_after_delay(Self::RERUN_STATUS_REFRESH_DELAY);
         });
     }
 
@@ -447,6 +517,17 @@ impl WorkflowRunsListWidget {
         self.set_loading_state(LoadingState::Loading);
         self.set_data_updated(true);
         Ok(())
+    }
+
+    fn refresh_runs_after_delay(self: Arc<Self>, delay: Duration) {
+        tokio::spawn(async move {
+            sleep(delay).await;
+            self.set_loading_state(LoadingState::Loading);
+            match self.get_detailed_workflow_runs().await {
+                Ok(runs) => self.clone().on_load(runs),
+                Err(err) => self.on_err(&err),
+            }
+        });
     }
 
     fn toggle_job_breakdown_pane(self: Arc<Self>) {
@@ -471,7 +552,8 @@ impl WorkflowRunsListWidget {
                 return;
             };
             let should_fetch = match &run.jobs {
-                JobsState::Loading | JobsState::Reloading(_) => false,
+                JobsState::Loading => false,
+                JobsState::Reloading(_) => true,
                 JobsState::NotLoaded => {
                     run.jobs = JobsState::Loading;
                     true
@@ -480,9 +562,22 @@ impl WorkflowRunsListWidget {
                     run.jobs = JobsState::Loading;
                     true
                 }
-                JobsState::Loaded(jobs) if run.status.as_str() == "in_progress" => {
+                JobsState::Loaded(jobs)
+                    if matches!(run.status.as_str(), "in_progress" | "queued" | "pending") =>
+                {
                     run.jobs = JobsState::Reloading(jobs.clone());
                     true
+                }
+                JobsState::Loaded(jobs) if run.status.as_str() == "completed" => {
+                    let has_incomplete_jobs = jobs.iter().any(|job| {
+                        !matches!(job.status, Status::Completed) || matches!(job.conclusion, None)
+                    });
+                    if has_incomplete_jobs {
+                        run.jobs = JobsState::Reloading(jobs.clone());
+                        true
+                    } else {
+                        false
+                    }
                 }
                 JobsState::Loaded(_) => false,
             };
@@ -790,8 +885,9 @@ struct WorkflowRun {
     conclusion: Option<String>,
     jobs: JobsState,
     failed_step_log: FailedStepLogState,
-    #[allow(dead_code)]
+    rerun_refresh_pending: bool,
     created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
     html_url: String,
 }
 
@@ -810,10 +906,22 @@ impl WorkflowRun {
 
         let details_lines = vec![{
             let status_symbol = get_run_status_symbol(&run.status, &run.conclusion);
-            Line::styled(
+            let duration = run.duration();
+            let mut spans = vec![Span::styled(
                 format!("{} {} - {}", status_symbol.symbol, run.name, run.commit),
                 Style::default().fg(status_symbol.color),
-            )
+            )];
+            spans.push(Span::styled(
+                format!(" {duration}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            if run.rerun_refresh_pending {
+                spans.push(Span::styled(
+                    "  [rerun requested, refreshing...]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Line::from(spans)
         }];
 
         RunRow {
@@ -821,6 +929,33 @@ impl WorkflowRun {
             branch: run.branch.clone(),
             details_lines,
         }
+    }
+
+    fn duration(&self) -> String {
+        if let Some(duration) = self.latest_attempt_duration() {
+            return duration;
+        }
+        match self.status.as_str() {
+            "completed" => format_duration(self.created_at, self.updated_at),
+            _ => format_duration(self.created_at, Utc::now()),
+        }
+    }
+
+    fn latest_attempt_duration(&self) -> Option<String> {
+        let jobs = match &self.jobs {
+            JobsState::Loaded(jobs) | JobsState::Reloading(jobs) if !jobs.is_empty() => jobs,
+            _ => return None,
+        };
+        let start = jobs.iter().map(|job| job.started_at).min()?;
+        let end = match self.status.as_str() {
+            "completed" => jobs
+                .iter()
+                .filter_map(|job| job.completed_at)
+                .max()
+                .unwrap_or(self.updated_at),
+            _ => Utc::now(),
+        };
+        Some(format_duration(start, end))
     }
 
     fn job_breakdown_lines(&self) -> Vec<Line<'static>> {
