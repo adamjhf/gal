@@ -18,6 +18,7 @@ use octocrab::{
         RunId,
         workflows::{Conclusion, Job, Run, Status},
     },
+    params::workflows::Filter,
 };
 use ratatui::DefaultTerminal;
 use ratatui::prelude::*;
@@ -155,6 +156,14 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
                 KeyCode::Char('j') | KeyCode::Down => self.workflow_runs.scroll_down(),
                 KeyCode::Char('k') | KeyCode::Up => self.workflow_runs.scroll_up(),
+                KeyCode::Char('h') | KeyCode::Left => {
+                    let runs = Arc::new(self.workflow_runs.clone());
+                    runs.select_previous_run_attempt()
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    let runs = Arc::new(self.workflow_runs.clone());
+                    runs.select_next_run_attempt()
+                }
                 KeyCode::Enter => self.workflow_runs.open_selected_workflow(),
                 KeyCode::Char('r') => {
                     let runs = Arc::new(self.workflow_runs.clone());
@@ -186,6 +195,7 @@ struct WorkflowRunsListState {
     throbber_state: ThrobberState,
     completed_workflow_jobs: HashMap<u64, Vec<Job>>,
     pending_reruns: HashMap<u64, PendingRerunMarker>,
+    selected_run_attempts: HashMap<u64, u32>,
     data_updated: bool,
     show_job_breakdown_pane: bool,
 }
@@ -281,6 +291,14 @@ impl WorkflowRunsListWidget {
             .map(|run| run.id);
         let previous_selected_index = state.table_state.selected().unwrap_or(0);
         state.workflow_runs = runs;
+        let valid_run_ids = state
+            .workflow_runs
+            .iter()
+            .map(|run| run.id.0)
+            .collect::<Vec<_>>();
+        state
+            .selected_run_attempts
+            .retain(|run_id, _| valid_run_ids.contains(run_id));
         state.data_updated = true;
         if !state.workflow_runs.is_empty() {
             if let Some(selected_run_id) = selected_run_id {
@@ -342,6 +360,71 @@ impl WorkflowRunsListWidget {
             let this = Arc::new(self.clone());
             this.clone().ensure_selected_workflow_jobs();
             this.ensure_selected_failed_step_log();
+        }
+    }
+
+    fn select_previous_run_attempt(self: Arc<Self>) {
+        self.select_run_attempt(-1);
+    }
+
+    fn select_next_run_attempt(self: Arc<Self>) {
+        self.select_run_attempt(1);
+    }
+
+    fn select_run_attempt(self: Arc<Self>, direction: i8) {
+        let should_reload_failed_log = {
+            let mut state = self.state.write().unwrap();
+            if !state.show_job_breakdown_pane {
+                return;
+            }
+            let Some(selected_index) = state.table_state.selected() else {
+                return;
+            };
+
+            let (run_id, attempts, selected_attempt) = {
+                let Some(run) = state.workflow_runs.get(selected_index) else {
+                    return;
+                };
+                let attempts = run.available_run_attempts();
+                if attempts.len() < 2 {
+                    return;
+                }
+                let selected_attempt = run.selected_or_latest_run_attempt(
+                    state.selected_run_attempts.get(&run.id.0).copied(),
+                );
+                let Some(selected_attempt) = selected_attempt else {
+                    return;
+                };
+                (run.id, attempts, selected_attempt)
+            };
+
+            let Some(current_index) = attempts
+                .iter()
+                .position(|attempt| *attempt == selected_attempt)
+            else {
+                return;
+            };
+            let target_index = if direction < 0 {
+                current_index.saturating_sub(1)
+            } else {
+                (current_index + 1).min(attempts.len() - 1)
+            };
+            if target_index == current_index {
+                return;
+            }
+
+            state
+                .selected_run_attempts
+                .insert(run_id.0, attempts[target_index]);
+            if let Some(run) = state.workflow_runs.get_mut(selected_index) {
+                run.failed_step_log = FailedStepLogState::NotLoaded;
+            }
+            state.data_updated = true;
+            true
+        };
+
+        if should_reload_failed_log {
+            self.ensure_selected_failed_step_log();
         }
     }
 
@@ -428,13 +511,15 @@ impl WorkflowRunsListWidget {
             Some(jobs) => jobs,
             None => {
                 debug!("fetching jobs for workflow run {}", run_id.0);
-                let jobs = self
+                let page = self
                     .client
                     .workflows(&self.repo.owner, &self.repo.name)
                     .list_jobs(run_id)
+                    .filter(Filter::All)
+                    .per_page(100)
                     .send()
-                    .await?
-                    .items;
+                    .await?;
+                let jobs = self.client.all_pages(page).await?;
                 if is_completed {
                     self.state
                         .write()
@@ -510,6 +595,7 @@ impl WorkflowRunsListWidget {
                     requested_at: Utc::now(),
                 },
             );
+            state.selected_run_attempts.remove(&run_id.0);
             if let Some(run) = state.workflow_runs.get_mut(selected_index) {
                 run.rerun_refresh_pending = true;
             }
@@ -668,7 +754,8 @@ impl WorkflowRunsListWidget {
                 return;
             };
             let run_id = run.id;
-            let failed_step = run.first_failed_step();
+            let selected_attempt = state.selected_run_attempts.get(&run_id.0).copied();
+            let failed_step = run.first_failed_step_for_attempt(selected_attempt);
             let current_failed_step_log = run.failed_step_log.clone();
             let Some(failed_step) = failed_step else {
                 if current_failed_step_log != FailedStepLogState::NotAvailable {
@@ -776,6 +863,8 @@ impl Widget for &WorkflowRunsListWidget {
                 .title_bottom(Line::from(vec![
                     Span::styled("j/k", white),
                     Span::from(" up/down  "),
+                    Span::styled("h/l/←/→", white),
+                    Span::from(" run view  "),
                     Span::styled("space", white),
                     Span::from(" toggle job pane  "),
                     Span::styled("r", white),
@@ -879,12 +968,18 @@ impl Widget for &WorkflowRunsListWidget {
                 .table_state
                 .selected()
                 .and_then(|selected_index| state.workflow_runs.get(selected_index));
+            let selected_attempt =
+                selected_run.and_then(|run| state.selected_run_attempts.get(&run.id.0).copied());
             let jobs_lines = selected_run.map_or_else(
                 || vec![Line::from("No workflow selected")],
-                WorkflowRun::job_breakdown_lines,
+                |run| run.job_breakdown_lines_for_attempt(selected_attempt),
+            );
+            let job_breakdown_title = selected_run.map_or_else(
+                || "Job Breakdown".to_string(),
+                |run| run.job_breakdown_title(selected_attempt),
             );
             let show_failed_logs = selected_run
-                .map(WorkflowRun::has_failed_step)
+                .map(|run| run.has_failed_step_for_attempt(selected_attempt))
                 .unwrap_or(false);
             let (job_breakdown_area, failed_log_area) = if show_failed_logs {
                 let needed_job_height = (jobs_lines.len() as u16).saturating_add(2);
@@ -902,7 +997,7 @@ impl Widget for &WorkflowRunsListWidget {
             };
 
             let jobs_paragraph = Paragraph::new(Text::from(jobs_lines))
-                .block(Block::bordered().title("Job Breakdown"));
+                .block(Block::bordered().title(job_breakdown_title));
             jobs_paragraph.render(job_breakdown_area, buf);
 
             if let Some(failed_log_area) = failed_log_area {
@@ -1032,13 +1127,58 @@ impl WorkflowRun {
         Some(format_duration(start, end))
     }
 
-    fn job_breakdown_lines(&self) -> Vec<Line<'static>> {
+    fn available_run_attempts(&self) -> Vec<u32> {
+        let jobs = match &self.jobs {
+            JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => jobs,
+            _ => return vec![],
+        };
+        let mut attempts = jobs.iter().map(|job| job.run_attempt).collect::<Vec<_>>();
+        attempts.sort_unstable();
+        attempts.dedup();
+        attempts
+    }
+
+    fn selected_or_latest_run_attempt(&self, selected_attempt: Option<u32>) -> Option<u32> {
+        let attempts = self.available_run_attempts();
+        if attempts.is_empty() {
+            return None;
+        }
+        selected_attempt
+            .filter(|attempt| attempts.contains(attempt))
+            .or_else(|| attempts.last().copied())
+    }
+
+    fn job_breakdown_title(&self, selected_attempt: Option<u32>) -> String {
+        let attempts = self.available_run_attempts();
+        if attempts.is_empty() {
+            return "Job Breakdown".to_string();
+        }
+        let selected_attempt = self
+            .selected_or_latest_run_attempt(selected_attempt)
+            .or_else(|| attempts.last().copied())
+            .unwrap_or_default();
+        let run_position = attempts
+            .iter()
+            .position(|attempt| *attempt == selected_attempt)
+            .map_or(attempts.len(), |index| index + 1);
+        format!("Job Breakdown ({run_position}/{})", attempts.len())
+    }
+
+    fn job_breakdown_lines_for_attempt(&self, selected_attempt: Option<u32>) -> Vec<Line<'static>> {
         match &self.jobs {
             JobsState::NotLoaded => vec![Line::from("Loading not started")],
             JobsState::Loading => vec![Line::from("Loading jobs...")],
             JobsState::LoadingError(err) => vec![Line::from(format!("Error loading jobs: {err}"))],
             JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => {
-                if jobs.is_empty() {
+                let Some(selected_attempt) = self.selected_or_latest_run_attempt(selected_attempt)
+                else {
+                    return vec![Line::from("No jobs in this run")];
+                };
+                let selected_jobs = jobs
+                    .iter()
+                    .filter(|job| job.run_attempt == selected_attempt)
+                    .collect::<Vec<_>>();
+                if selected_jobs.is_empty() {
                     return vec![Line::from("No jobs in this run")];
                 }
                 let mut all_items = vec![Line::styled(
@@ -1046,8 +1186,8 @@ impl WorkflowRun {
                     Style::default().fg(Color::White).bold(),
                 )];
 
-                for (job_index, job) in jobs.iter().enumerate() {
-                    let is_last_job = job_index == jobs.len() - 1;
+                for (job_index, job) in selected_jobs.iter().copied().enumerate() {
+                    let is_last_job = job_index == selected_jobs.len() - 1;
                     let job_prefix = if is_last_job { "└─ " } else { "├─ " };
                     let job_status = get_job_status_symbol(&job.status, &job.conclusion);
                     let duration = match (&job.status, job.completed_at) {
@@ -1099,31 +1239,42 @@ impl WorkflowRun {
         }
     }
 
-    fn has_failed_step(&self) -> bool {
-        self.first_failed_step().is_some()
+    fn has_failed_step_for_attempt(&self, selected_attempt: Option<u32>) -> bool {
+        self.first_failed_step_for_attempt(selected_attempt)
+            .is_some()
     }
 
-    fn first_failed_step(&self) -> Option<FailedStepRef> {
+    fn first_failed_step_for_attempt(
+        &self,
+        selected_attempt: Option<u32>,
+    ) -> Option<FailedStepRef> {
         match &self.jobs {
-            JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => jobs.iter().find_map(|job| {
-                job.steps.iter().find_map(|step| {
-                    let failed = matches!(
-                        step.conclusion.as_ref(),
-                        Some(
-                            Conclusion::Failure | Conclusion::TimedOut | Conclusion::ActionRequired
-                        )
-                    );
-                    if failed {
-                        Some(FailedStepRef {
-                            job_id: job.id.0,
-                            job_name: job.name.clone(),
-                            step_name: step.name.clone(),
+            JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => {
+                let selected_attempt = self.selected_or_latest_run_attempt(selected_attempt)?;
+                jobs.iter()
+                    .filter(|job| job.run_attempt == selected_attempt)
+                    .find_map(|job| {
+                        job.steps.iter().find_map(|step| {
+                            let failed = matches!(
+                                step.conclusion.as_ref(),
+                                Some(
+                                    Conclusion::Failure
+                                        | Conclusion::TimedOut
+                                        | Conclusion::ActionRequired
+                                )
+                            );
+                            if failed {
+                                Some(FailedStepRef {
+                                    job_id: job.id.0,
+                                    job_name: job.name.clone(),
+                                    step_name: step.name.clone(),
+                                })
+                            } else {
+                                None
+                            }
                         })
-                    } else {
-                        None
-                    }
-                })
-            }),
+                    })
+            }
             _ => None,
         }
     }
