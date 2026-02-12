@@ -209,6 +209,7 @@ struct FailedStepRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingRerunMarker {
     baseline_max_run_attempt: u32,
+    requested_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,8 +240,10 @@ impl WorkflowRunsListWidget {
     }
 
     fn new(client: Octocrab, repo: GitHubRepo, branches: Option<Vec<String>>) -> Self {
-        let mut state = WorkflowRunsListState::default();
-        state.show_job_breakdown_pane = true;
+        let state = WorkflowRunsListState {
+            show_job_breakdown_pane: true,
+            ..Default::default()
+        };
         Self {
             state: Arc::new(RwLock::new(state)),
             client,
@@ -387,6 +390,9 @@ impl WorkflowRunsListWidget {
                     }
                     _ => existing_jobs,
                 };
+                let rerun_requested_at = active_pending_reruns
+                    .get(&run.id.0)
+                    .map(|marker| marker.requested_at);
                 WorkflowRun {
                     id: run.id,
                     name: run.name,
@@ -400,6 +406,7 @@ impl WorkflowRunsListWidget {
                         None => FailedStepLogState::NotLoaded,
                     },
                     rerun_refresh_pending: active_pending_reruns.contains_key(&run.id.0),
+                    rerun_requested_at,
                     created_at: run.created_at,
                     updated_at: run.updated_at,
                     html_url: run.html_url.clone().into(),
@@ -456,7 +463,7 @@ impl WorkflowRunsListWidget {
                 });
                 let results = try_join_all(futures).await?;
                 let mut runs = results.into_iter().flatten().collect::<Vec<_>>();
-                runs.sort_unstable_by(|a, b| b.id.0.cmp(&a.id.0));
+                runs.sort_unstable_by_key(|run| std::cmp::Reverse(run.id.0));
                 runs
             }
             None => {
@@ -500,6 +507,7 @@ impl WorkflowRunsListWidget {
                 run_id.0,
                 PendingRerunMarker {
                     baseline_max_run_attempt,
+                    requested_at: Utc::now(),
                 },
             );
             if let Some(run) = state.workflow_runs.get_mut(selected_index) {
@@ -596,7 +604,7 @@ impl WorkflowRunsListWidget {
                 }
                 JobsState::Loaded(jobs) if run.status.as_str() == "completed" => {
                     let has_incomplete_jobs = jobs.iter().any(|job| {
-                        !matches!(job.status, Status::Completed) || matches!(job.conclusion, None)
+                        !matches!(job.status, Status::Completed) || job.conclusion.is_none()
                     });
                     if has_incomplete_jobs {
                         run.jobs = JobsState::Reloading(jobs.clone());
@@ -929,6 +937,7 @@ struct WorkflowRun {
     jobs: JobsState,
     failed_step_log: FailedStepLogState,
     rerun_refresh_pending: bool,
+    rerun_requested_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     html_url: String,
@@ -988,6 +997,10 @@ impl WorkflowRun {
             return duration;
         }
         match self.status.as_str() {
+            _ if self.rerun_refresh_pending => self.rerun_requested_at.map_or_else(
+                || "0s".to_string(),
+                |requested| format_duration(requested, Utc::now()),
+            ),
             "completed" => format_duration(self.created_at, self.updated_at),
             _ => format_duration(self.created_at, Utc::now()),
         }
@@ -1004,13 +1017,17 @@ impl WorkflowRun {
             .filter(|job| job.run_attempt == latest_run_attempt)
             .collect::<Vec<_>>();
         let start = latest_attempt_jobs.iter().map(|job| job.started_at).min()?;
-        let end = match self.status.as_str() {
-            "completed" => latest_attempt_jobs
+        let attempt_in_progress = latest_attempt_jobs
+            .iter()
+            .any(|job| !matches!(job.status, Status::Completed) || job.completed_at.is_none());
+        let end = if attempt_in_progress {
+            Utc::now()
+        } else {
+            latest_attempt_jobs
                 .iter()
                 .filter_map(|job| job.completed_at)
                 .max()
-                .unwrap_or(self.updated_at),
-            _ => Utc::now(),
+                .unwrap_or(self.updated_at)
         };
         Some(format_duration(start, end))
     }
