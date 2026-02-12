@@ -975,7 +975,7 @@ impl Widget for &WorkflowRunsListWidget {
                 |run| run.job_breakdown_lines_for_attempt(selected_attempt),
             );
             let job_breakdown_title = selected_run.map_or_else(
-                || "Job Breakdown".to_string(),
+                || Line::from("Job Breakdown"),
                 |run| run.job_breakdown_title(selected_attempt),
             );
             let show_failed_logs = selected_run
@@ -1148,10 +1148,10 @@ impl WorkflowRun {
             .or_else(|| attempts.last().copied())
     }
 
-    fn job_breakdown_title(&self, selected_attempt: Option<u32>) -> String {
+    fn job_breakdown_title(&self, selected_attempt: Option<u32>) -> Line<'static> {
         let attempts = self.available_run_attempts();
         if attempts.is_empty() {
-            return "Job Breakdown".to_string();
+            return Line::from("Job Breakdown");
         }
         let selected_attempt = self
             .selected_or_latest_run_attempt(selected_attempt)
@@ -1161,7 +1161,13 @@ impl WorkflowRun {
             .iter()
             .position(|attempt| *attempt == selected_attempt)
             .map_or(attempts.len(), |index| index + 1);
-        format!("Job Breakdown ({run_position}/{})", attempts.len())
+        Line::from(vec![
+            Span::from("Job Breakdown "),
+            Span::styled(
+                format!("({run_position}/{})", attempts.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     }
 
     fn job_breakdown_lines_for_attempt(&self, selected_attempt: Option<u32>) -> Vec<Line<'static>> {
@@ -1181,10 +1187,13 @@ impl WorkflowRun {
                 if selected_jobs.is_empty() {
                     return vec![Line::from("No jobs in this run")];
                 }
-                let mut all_items = vec![Line::styled(
-                    format!("{} ({})", self.name, self.id.0),
-                    Style::default().fg(Color::White).bold(),
-                )];
+                let mut all_items = vec![Line::from(vec![
+                    Span::styled(self.name.clone(), Style::default().fg(Color::White).bold()),
+                    Span::styled(
+                        format!(" ({})", self.id.0),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])];
 
                 for (job_index, job) in selected_jobs.iter().copied().enumerate() {
                     let is_last_job = job_index == selected_jobs.len() - 1;
