@@ -833,7 +833,7 @@ impl WorkflowRunsListWidget {
     fn calculate_column_widths(&self, headers: &[&str], rows: &[RunRow]) -> Vec<Constraint> {
         let mut max_widths = headers
             .iter()
-            .take(2)
+            .take(3)
             .map(|h| UnicodeWidthStr::width(*h))
             .collect::<Vec<_>>();
 
@@ -842,6 +842,9 @@ impl WorkflowRunsListWidget {
             max_widths[1] = max_widths[1]
                 .max(UnicodeWidthStr::width(row.branch.as_str()))
                 .min(25);
+            max_widths[2] = max_widths[2]
+                .max(UnicodeWidthStr::width(row.workflow_text.as_str()))
+                .min(40);
         }
 
         max_widths
@@ -910,7 +913,7 @@ impl Widget for &WorkflowRunsListWidget {
 
             paragraph.render(table_area, buf);
         } else {
-            let headers = ["Time", "Branch", "Run"];
+            let headers = ["Time", "Branch", "Workflow", "Commit"];
             let header = headers
                 .into_iter()
                 .map(Cell::from)
@@ -926,13 +929,13 @@ impl Widget for &WorkflowRunsListWidget {
                 .iter()
                 .map(|run| run.to_row())
                 .collect::<Vec<RunRow>>();
-            let headers = ["Time", "Branch", "Run"];
+            let headers = ["Time", "Branch", "Workflow", "Commit"];
             let widths = self.calculate_column_widths(&headers, &run_rows);
             let rows = run_rows
                 .into_iter()
                 .enumerate()
                 .map(|(i, run)| {
-                    let row_height = run.details_lines.len() as i32;
+                    let row_height = run.height() as i32;
                     let visible_height = if i < offset {
                         row_height
                     } else if consumed_height < max_height
@@ -948,7 +951,8 @@ impl Widget for &WorkflowRunsListWidget {
                     let row: Row = Row::new(vec![
                         Cell::from(run.time.clone()),
                         Cell::from(run.branch.clone()),
-                        Cell::from(run.details_lines.clone()),
+                        Cell::from(run.workflow_lines.clone()),
+                        Cell::from(run.commit_lines.clone()),
                     ]);
                     row.height(visible_height as u16)
                 })
@@ -1060,17 +1064,17 @@ impl WorkflowRun {
     fn to_row(&self) -> RunRow {
         let run = self;
 
-        let details_lines = vec![{
-            let status_symbol = get_run_status_symbol(&run.status, &run.conclusion);
-            let duration = run.duration();
-            let mut spans = vec![Span::styled(
-                format!("{} {} - {}", status_symbol.symbol, run.name, run.commit),
+        let status_symbol = get_run_status_symbol(&run.status, &run.conclusion);
+        let duration = run.duration();
+        let workflow_lines = vec![Line::from(vec![
+            Span::styled(
+                format!("{} {}", status_symbol.symbol, run.name),
                 Style::default().fg(status_symbol.color),
-            )];
-            spans.push(Span::styled(
-                format!(" {duration}"),
-                Style::default().fg(Color::DarkGray),
-            ));
+            ),
+            Span::styled(format!(" {duration}"), Style::default().fg(Color::DarkGray)),
+        ])];
+        let commit_lines = vec![{
+            let mut spans = vec![Span::from(run.commit.clone())];
             if run.rerun_refresh_pending {
                 spans.push(Span::styled(
                     "  [rerun requested, refreshing...]",
@@ -1083,7 +1087,9 @@ impl WorkflowRun {
         RunRow {
             time: format_relative_time(run.created_at),
             branch: run.branch.clone(),
-            details_lines,
+            workflow_text: format!("{} {} {}", status_symbol.symbol, run.name, duration),
+            workflow_lines,
+            commit_lines,
         }
     }
 
@@ -1337,7 +1343,15 @@ impl WorkflowRun {
 struct RunRow {
     time: String,
     branch: String,
-    details_lines: Vec<Line<'static>>,
+    workflow_text: String,
+    workflow_lines: Vec<Line<'static>>,
+    commit_lines: Vec<Line<'static>>,
+}
+
+impl RunRow {
+    fn height(&self) -> usize {
+        self.workflow_lines.len().max(self.commit_lines.len())
+    }
 }
 
 struct StatusDisplay {
