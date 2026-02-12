@@ -1135,8 +1135,9 @@ fn format_duration(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
 fn get_run_status_symbol(status: &str, conclusion: &Option<String>) -> StatusDisplay {
     match status {
         "in_progress" => ("⏵", Color::Yellow),
-        "queued" => ("⏸", Color::Blue),
-        "pending" => ("⏸", Color::Blue),
+        "queued" => ("◷", Color::Blue),
+        "pending" => ("◷", Color::Blue),
+        "paused" => ("⏸", Color::Blue),
         "completed" => match conclusion.as_ref().map(|s| s.as_str()) {
             Some("success") => ("✔", Color::Green),
             Some("failure") => ("⚠", Color::Red),
@@ -1154,8 +1155,8 @@ fn get_run_status_symbol(status: &str, conclusion: &Option<String>) -> StatusDis
 fn get_job_status_symbol(status: &Status, conclusion: &Option<Conclusion>) -> StatusDisplay {
     match status {
         Status::InProgress => ("⏵", Color::Yellow),
-        Status::Queued => ("⏸", Color::Blue),
-        Status::Pending => ("⏸", Color::Blue),
+        Status::Queued => ("◷", Color::Blue),
+        Status::Pending => ("◷", Color::Blue),
         Status::Completed => match conclusion.as_ref() {
             Some(Conclusion::Success) => ("✔", Color::Green),
             Some(Conclusion::Failure) => ("⚠", Color::Red),
