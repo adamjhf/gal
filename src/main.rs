@@ -401,7 +401,28 @@ impl WorkflowRunsListWidget {
     }
 
     fn on_err(&self, err: &ErrReport) {
-        self.set_loading_state(LoadingState::Error(format!("{err:?}")));
+        error!("{err:?}");
+        self.set_loading_state(LoadingState::Error(self.format_user_facing_error(err)));
+    }
+
+    fn format_user_facing_error(&self, err: &ErrReport) -> String {
+        if let Some(octocrab_err) = err.downcast_ref::<octocrab::Error>()
+            && let octocrab::Error::GitHub { source, .. } = octocrab_err
+        {
+            return match source.status_code.as_u16() {
+                404 => format!(
+                    "Repository not found or inaccessible: {}\nCheck --repo owner/repo and verify GITHUB_TOKEN can access this repo.",
+                    self.repo.full_name()
+                ),
+                401 | 403 => format!(
+                    "GitHub authentication/authorization failed for {}\nVerify GITHUB_TOKEN is set and has repo access.",
+                    self.repo.full_name()
+                ),
+                _ => format!("GitHub error ({}): {}", source.status_code, source.message),
+            };
+        }
+
+        format!("Error: {err}")
     }
 
     fn set_loading_state(&self, state: LoadingState) {
@@ -572,7 +593,9 @@ impl WorkflowRunsListWidget {
                     None => JobsState::NotLoaded,
                 };
                 let jobs = match (&existing_jobs, run.status.as_str()) {
-                    (JobsState::NotLoaded | JobsState::LoadingError(_), "completed") => {
+                    (JobsState::NotLoaded | JobsState::LoadingError(_), "completed")
+                        if fetch_to_target =>
+                    {
                         match this.get_workflow_jobs(run.id, true).await {
                             Ok(jobs) => JobsState::Loaded(jobs),
                             Err(err) => {
