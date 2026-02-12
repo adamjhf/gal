@@ -2,7 +2,7 @@
 
 A terminal-based GitHub Actions workflow monitor that provides near-real-time updates on your CI/CD pipelines.
 
-![Image](https://github.com/user-attachments/assets/06d5eec3-871c-4c06-bf5e-bec3de02d727)
+<img width="1311" height="604" alt="image" src="https://github.com/user-attachments/assets/e5548df3-e682-4815-8a82-269b841df940" />
 
 ## Installation
 
