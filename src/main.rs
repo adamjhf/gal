@@ -208,8 +208,7 @@ struct FailedStepRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingRerunMarker {
-    workflow_name: String,
-    branch: String,
+    baseline_max_run_attempt: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,10 +271,29 @@ impl WorkflowRunsListWidget {
         let mut state = self.state.write().unwrap();
         state.loading_state = LoadingState::Loaded;
         let was_empty = state.workflow_runs.is_empty();
+        let selected_run_id = state
+            .table_state
+            .selected()
+            .and_then(|index| state.workflow_runs.get(index))
+            .map(|run| run.id);
+        let previous_selected_index = state.table_state.selected().unwrap_or(0);
         state.workflow_runs = runs;
         state.data_updated = true;
-        if !state.workflow_runs.is_empty() && was_empty {
-            state.table_state.select(Some(0));
+        if !state.workflow_runs.is_empty() {
+            if let Some(selected_run_id) = selected_run_id {
+                if let Some(new_index) = state
+                    .workflow_runs
+                    .iter()
+                    .position(|run| run.id == selected_run_id)
+                {
+                    state.table_state.select(Some(new_index));
+                } else {
+                    let clamped = previous_selected_index.min(state.workflow_runs.len() - 1);
+                    state.table_state.select(Some(clamped));
+                }
+            } else if was_empty {
+                state.table_state.select(Some(0));
+            }
         }
         drop(state);
         self.clone().ensure_selected_workflow_jobs();
@@ -332,28 +350,6 @@ impl WorkflowRunsListWidget {
                 return Err(err);
             }
         };
-        let pending_reruns = {
-            let state = self.state.read().unwrap();
-            state.pending_reruns.clone()
-        };
-        let resolved_pending_rerun_ids = pending_reruns
-            .iter()
-            .filter_map(|(source_run_id, marker)| {
-                let started = workflows.iter().any(|run| {
-                    run.id.0 > *source_run_id
-                        && run.name == marker.workflow_name
-                        && run.head_branch == marker.branch
-                        && matches!(run.status.as_str(), "queued" | "in_progress" | "pending")
-                });
-                if started { Some(*source_run_id) } else { None }
-            })
-            .collect::<Vec<_>>();
-        if !resolved_pending_rerun_ids.is_empty() {
-            let mut state = self.state.write().unwrap();
-            for source_run_id in resolved_pending_rerun_ids {
-                state.pending_reruns.remove(&source_run_id);
-            }
-        }
         let active_pending_reruns = {
             let state = self.state.read().unwrap();
             state.pending_reruns.clone()
@@ -366,10 +362,31 @@ impl WorkflowRunsListWidget {
                 .map(|run| (run.id, (run.jobs.clone(), run.failed_step_log.clone())))
                 .collect::<HashMap<RunId, (JobsState, FailedStepLogState)>>()
         });
+        let this = self.clone();
         let details_futures = workflows.into_iter().map(|run| {
+            let this = this.clone();
             let existing_workflow_runs = existing_workflow_runs.clone();
             let active_pending_reruns = active_pending_reruns.clone();
             async move {
+                let existing_jobs = match existing_workflow_runs.get(&run.id) {
+                    Some((jobs, _)) => jobs.clone(),
+                    None => JobsState::NotLoaded,
+                };
+                let jobs = match (&existing_jobs, run.status.as_str()) {
+                    (JobsState::NotLoaded | JobsState::LoadingError(_), "completed") => {
+                        match this.get_workflow_jobs(run.id, true).await {
+                            Ok(jobs) => JobsState::Loaded(jobs),
+                            Err(err) => {
+                                error!(
+                                    "failed to fetch jobs for completed run {}: {}",
+                                    run.id.0, err
+                                );
+                                existing_jobs
+                            }
+                        }
+                    }
+                    _ => existing_jobs,
+                };
                 WorkflowRun {
                     id: run.id,
                     name: run.name,
@@ -377,10 +394,7 @@ impl WorkflowRunsListWidget {
                     branch: run.head_branch.to_string(),
                     status: run.status,
                     conclusion: run.conclusion,
-                    jobs: match existing_workflow_runs.get(&run.id) {
-                        Some((jobs, _)) => jobs.clone(),
-                        None => JobsState::NotLoaded,
-                    },
+                    jobs,
                     failed_step_log: match existing_workflow_runs.get(&run.id) {
                         Some((_, failed_step_log)) => failed_step_log.clone(),
                         None => FailedStepLogState::NotLoaded,
@@ -467,13 +481,25 @@ impl WorkflowRunsListWidget {
                 return;
             };
             let run_id = run.id;
-            let workflow_name = run.name.clone();
-            let branch = run.branch.clone();
+            let baseline_jobs = run.jobs.as_jobs();
+            let mut baseline_max_run_attempt = baseline_jobs
+                .iter()
+                .map(|job| job.run_attempt)
+                .max()
+                .unwrap_or(0);
+            if baseline_max_run_attempt == 0
+                && let Some(cached_jobs) = state.completed_workflow_jobs.get(&run_id.0)
+            {
+                baseline_max_run_attempt = cached_jobs
+                    .iter()
+                    .map(|job| job.run_attempt)
+                    .max()
+                    .unwrap_or(0);
+            }
             state.pending_reruns.insert(
                 run_id.0,
                 PendingRerunMarker {
-                    workflow_name,
-                    branch,
+                    baseline_max_run_attempt,
                 },
             );
             if let Some(run) = state.workflow_runs.get_mut(selected_index) {
@@ -513,7 +539,7 @@ impl WorkflowRunsListWidget {
             repo = self.repo.name,
             run_id = run_id.0,
         );
-        let _: () = self.client.post(route, None::<&()>).await?;
+        let _: serde_json::Value = self.client.post(route, None::<&()>).await?;
         self.set_loading_state(LoadingState::Loading);
         self.set_data_updated(true);
         Ok(())
@@ -595,8 +621,25 @@ impl WorkflowRunsListWidget {
             };
             let mut refresh_failed_step_logs = false;
             let mut state = state_arc.write().unwrap();
+            let mut clear_pending = false;
+            if let JobsState::Loaded(jobs) = &jobs_state {
+                let current_max_run_attempt =
+                    jobs.iter().map(|job| job.run_attempt).max().unwrap_or(0);
+                if let Some(marker) = state.pending_reruns.get_mut(&run_id.0) {
+                    if marker.baseline_max_run_attempt > 0 {
+                        clear_pending = current_max_run_attempt > marker.baseline_max_run_attempt;
+                    } else if current_max_run_attempt > 0 {
+                        marker.baseline_max_run_attempt = current_max_run_attempt;
+                    }
+                }
+            }
+            if clear_pending {
+                state.pending_reruns.remove(&run_id.0);
+            }
+            let is_pending = state.pending_reruns.contains_key(&run_id.0);
             if let Some(run) = state.workflow_runs.iter_mut().find(|run| run.id == run_id) {
                 run.jobs = jobs_state;
+                run.rerun_refresh_pending = is_pending;
                 state.data_updated = true;
                 refresh_failed_step_logs = true;
             }
@@ -900,6 +943,15 @@ enum JobsState {
     LoadingError(String),
 }
 
+impl JobsState {
+    fn as_jobs(&self) -> &[Job] {
+        match self {
+            JobsState::Loaded(jobs) | JobsState::Reloading(jobs) => jobs.as_slice(),
+            _ => &[],
+        }
+    }
+}
+
 impl WorkflowRun {
     fn to_row(&self) -> RunRow {
         let run = self;
@@ -946,9 +998,14 @@ impl WorkflowRun {
             JobsState::Loaded(jobs) | JobsState::Reloading(jobs) if !jobs.is_empty() => jobs,
             _ => return None,
         };
-        let start = jobs.iter().map(|job| job.started_at).min()?;
+        let latest_run_attempt = jobs.iter().map(|job| job.run_attempt).max()?;
+        let latest_attempt_jobs = jobs
+            .iter()
+            .filter(|job| job.run_attempt == latest_run_attempt)
+            .collect::<Vec<_>>();
+        let start = latest_attempt_jobs.iter().map(|job| job.started_at).min()?;
         let end = match self.status.as_str() {
-            "completed" => jobs
+            "completed" => latest_attempt_jobs
                 .iter()
                 .filter_map(|job| job.completed_at)
                 .max()

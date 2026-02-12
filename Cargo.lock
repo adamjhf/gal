@@ -671,6 +671,7 @@ dependencies = [
  "futures",
  "octocrab",
  "ratatui",
+ "serde_json",
  "throbber-widgets-tui",
  "tokio",
  "tokio-stream",
