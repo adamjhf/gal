@@ -121,7 +121,7 @@ impl App {
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         if let Ok((_, rows)) = crossterm::terminal::size() {
             self.workflow_runs
-                .set_min_runs_to_fetch(rows.saturating_sub(3) as usize);
+                .set_min_runs_to_fetch(rows.saturating_sub(4) as usize);
         }
         self.workflow_runs.run();
 
@@ -156,7 +156,34 @@ impl App {
     }
 
     fn render(&self, frame: &mut Frame) {
-        frame.render_widget(&self.workflow_runs, frame.area());
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(frame.area());
+
+        frame.render_widget(&self.workflow_runs, layout[0]);
+        frame.render_widget(
+            Paragraph::new(Self::key_hints_line()),
+            layout[1],
+        );
+    }
+
+    fn key_hints_line() -> Line<'static> {
+        let white = Style::default().fg(Color::White);
+        Line::from(vec![
+            Span::styled("j/k", white),
+            Span::from(" up/down  "),
+            Span::styled("h/l/←/→", white),
+            Span::from(" run view  "),
+            Span::styled("space", white),
+            Span::from(" toggle job pane  "),
+            Span::styled("r", white),
+            Span::from(" rerun run  "),
+            Span::styled("enter", white),
+            Span::from(" open browser  "),
+            Span::styled("q", white),
+            Span::from(" quit"),
+        ])
     }
 
     fn handle_event(&mut self, event: &Event) {
@@ -1057,33 +1084,18 @@ impl Widget for &WorkflowRunsListWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let mut state = self.state.write().unwrap();
 
-        let white = Style::default().fg(Color::White);
-        let mut table_block =
-            Block::bordered()
-                .title(self.repo.full_name())
-                .title_bottom(Line::from(vec![
-                    Span::styled("j/k", white),
-                    Span::from(" up/down  "),
-                    Span::styled("h/l/←/→", white),
-                    Span::from(" run view  "),
-                    Span::styled("space", white),
-                    Span::from(" toggle job pane  "),
-                    Span::styled("r", white),
-                    Span::from(" rerun run  "),
-                    Span::styled("enter", white),
-                    Span::from(" open browser  "),
-                    Span::styled("q", white),
-                    Span::from(" quit"),
-                ]));
+        let mut table_block = Block::bordered().title(pad_title(Line::from(self.repo.full_name())));
 
         table_block = match &state.loading_state {
             LoadingState::Loading => {
                 let throbber = Throbber::default().throbber_set(throbber_widgets_tui::BRAILLE_ONE);
                 let throbber_span = throbber.to_symbol_span(&state.throbber_state);
                 let throbber_text = throbber_span.content.as_ref().trim_end().to_string();
-                table_block.title(Line::from(throbber_text).right_aligned())
+                table_block.title(pad_title(Line::from(throbber_text)).right_aligned())
             }
-            LoadingState::Error(_) => table_block.title(Line::from("Error").right_aligned()),
+            LoadingState::Error(_) => {
+                table_block.title(pad_title(Line::from("Error")).right_aligned())
+            }
             _ => table_block,
         };
 
@@ -1208,7 +1220,7 @@ impl Widget for &WorkflowRunsListWidget {
             };
 
             let jobs_paragraph = Paragraph::new(Text::from(jobs_lines))
-                .block(Block::bordered().title(job_breakdown_title));
+                .block(Block::bordered().title(pad_title(job_breakdown_title)));
             jobs_paragraph.render(job_breakdown_area, buf);
 
             if let Some(failed_log_area) = failed_log_area {
@@ -1224,12 +1236,18 @@ impl Widget for &WorkflowRunsListWidget {
                         failed_log_lines[failed_log_lines.len() - visible_lines..].to_vec()
                     };
                 let failed_log_paragraph = Paragraph::new(Text::from(failed_log_lines))
-                    .block(Block::bordered().title("Failed Step Log Tail"))
+                    .block(Block::bordered().title(pad_title(Line::from("Failed Step Log Tail"))))
                     .wrap(ratatui::widgets::Wrap { trim: false });
                 failed_log_paragraph.render(failed_log_area, buf);
             }
         }
     }
+}
+
+fn pad_title(mut title: Line<'static>) -> Line<'static> {
+    title.spans.insert(0, Span::from(" "));
+    title.spans.push(Span::from(" "));
+    title
 }
 
 #[derive(Debug, Clone)]
