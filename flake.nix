@@ -26,7 +26,7 @@
 
         # https://github.com/nix-community/fenix/issues/178
         cargo = profile.cargo.overrideAttrs (old: {
-          postBuild = pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+          postBuild = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
             cargo="./cargo/bin/cargo"
             install_name_tool \
               -change "/usr/lib/libcurl.4.dylib" "${pkgs.curl.out}/lib/libcurl.4.dylib" \
@@ -60,20 +60,20 @@
             doCheck = false;
             cargoCheckCommand = "${pkgs.coreutils}/bin/true";
 
-            buildInputs = with pkgs; lib.optionals stdenv.isDarwin [ libiconv ];
+            buildInputs = with pkgs; lib.optionals stdenv.hostPlatform.isDarwin [ libiconv ];
 
             nativeBuildInputs =
               with pkgs;
-              lib.optionals stdenv.isLinux [
+              lib.optionals stdenv.hostPlatform.isLinux [
                 clang
                 mold
                 patchelf
               ];
 
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER =
-              if !pkgs.stdenv.isDarwin then "${pkgs.clang}/bin/clang" else null;
+              if !pkgs.stdenv.hostPlatform.isDarwin then "${pkgs.clang}/bin/clang" else null;
             CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS =
-              if !pkgs.stdenv.isDarwin then "-C link-arg=-fuse-ld=${pkgs.mold}/bin/mold" else null;
+              if !pkgs.stdenv.hostPlatform.isDarwin then "-C link-arg=-fuse-ld=${pkgs.mold}/bin/mold" else null;
           };
 
         gal = craneLib.buildPackage (
