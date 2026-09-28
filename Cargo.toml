@@ -26,7 +26,7 @@ tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 unicode-width = "0.2.2"
 webbrowser = "1.1.0"
-zip = { version = "7.4.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "gal"
